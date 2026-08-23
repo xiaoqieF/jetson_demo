@@ -1,0 +1,208 @@
+# LibArgus ROS2 同进程管线
+
+这是一个 Jetson **LibArgus** 与 ROS2 的同进程图像管线：相机 node 保持 Argus
+YUV surface，推理 node 和可视化 node 通过自定义消息取得同一个进程内 frame，不把
+采集图像复制到 CPU `sensor_msgs/Image`。
+
+## 图像链路
+
+LibArgus 的硬件采集路径为：
+
+```text
+MIPI CSI-2 sensor
+        │
+        ▼
+  VI / CSI receiver
+        │
+        └── ISP（去马赛克、白平衡、降噪、色彩校正等）
+                └── YCbCr_420_888 EGLStream
+                        ├── YOLOv8-seg TensorRT 推理 → /camera/inference/segmentation
+                        └── JPEG 编码 → /camera/image/compressed
+```
+
+## 代码主线
+
+`argus_camera` 按下面的 LibArgus 对象关系组织：
+
+1. `CameraProvider` / `ICameraProvider`：连接 Argus 服务、枚举摄像头。
+2. `CaptureSession` / `ICaptureSession`：针对一个摄像头创建采集会话。
+3. `YCbCr OutputStream`：将 `PIXEL_FMT_YCbCr_420_888` 输出到 EGLStream。
+4. `EGLStream::FrameConsumer`：获取完成的 `Frame` 并放入进程内 packet 的 shared owner。
+5. `ArgusFramePacket`：通过 ROS2 `TypeAdapter` 在进程内传递 frame shared pointer；对外只转换并发布元数据。
+6. 可视化 node：从同一个 frame 创建 JPEG 编码输入 dmabuf。
+
+LibArgus 的对象通常通过 `UniqueObj<T>` 管理；同一个对象的不同能力通过 `interface_cast<IXXX>()` 获取。这是学习 LibArgus 时最重要的两个惯用模式。
+
+## Package 结构
+
+```text
+src/argus_interfaces       ROS message 定义
+src/argus_transport        进程内 ArgusFramePacket 和 frame owner
+src/argus_camera           Argus camera component
+src/argus_inference        YOLOv8-seg TensorRT inference component
+src/argus_visualization    JPEG 输出 component
+src/argus_bringup          component container launch
+```
+
+三个业务 node 位于不同 package，但由同一个 `component_container_mt` 进程加载，因此
+`argus_transport` 中的 `ArgusFramePacket` 能够共享同一个 Argus frame owner。相机组件
+加载后立即开始采集，不依赖某个固定数量的消费者；在消费者连接前产生的帧会被正常丢弃。
+
+## 编译
+
+本示例默认使用 Jetson Multimedia API 的安装路径：
+
+```bash
+source /opt/ros/jazzy/setup.bash
+colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Debug
+source install/setup.bash
+```
+
+如果 SDK 在其他位置，可以在对应 package 的 CMake 配置中覆盖路径：
+
+```bash
+colcon build --symlink-install --cmake-args \
+  -DARGUS_ROOT=/path/to/jetson_multimedia_api/argus \
+  -DARGUS_INCLUDE_DIR=/path/to/argus/include
+```
+
+CMake 会链接 `nvargus_socketclient`。在当前 Jetson 系统上，它位于 `/usr/lib/aarch64-linux-gnu/nvidia/`；CMake 已包含常见的 `nvidia`、`tegra` 和架构库目录搜索路径。
+
+## 运行前检查
+
+- 在 Jetson 上运行，而不是普通 x86 Linux 主机；
+- `nvargus-daemon` 已启动；
+- 摄像头排线、驱动和设备树配置正常；
+- 没有其它程序占用摄像头；
+- 如果通过 SSH 运行，JPEG 编码通常仍可工作，但预览/显示类 EGL 示例可能需要图形会话。
+
+## 常见问题
+
+`CameraProvider::create()` 返回空：通常是 `nvargus-daemon` 未运行、驱动未加载，或当前平台不是 Jetson。
+
+`createCaptureSession` 返回 `STATUS_UNAVAILABLE`：摄像头被其它进程占用，先退出 `nvarguscamerasrc`、`nvgstcapture-1.0` 等程序。
+
+`acquireFrame` 超时：检查 sensor mode、摄像头连接和 Argus 日志；也可以先用 `v4l2-ctl --list-devices` 确认设备是否出现。
+
+`当前 sensor mode 不支持 YUV 输出`：检查 sensor mode、摄像头类型和 Argus override 配置。
+
+## ROS2 同进程多节点连续采集链路
+
+连续采集现在由一个进程中的三个 ROS2 node 组成：
+
+```text
+argus_camera_node
+    └── /camera/image/yuv (argus_interfaces/msg/ArgusYuvFrame)
+          ├── yuv_inference_node
+          └── yuv_visualization_node
+                    └── /camera/image/compressed (sensor_msgs/CompressedImage)
+```
+
+三个 node 使用 `MultiThreadedExecutor` 和 ROS2 intra-process communication。camera node
+发布 `argus_transport::ArgusFramePacket`，packet 内部通过 `shared_ptr` 持有
+`Argus::UniqueObj<EGLStream::Frame>`；inference 和 visualization 收到的是同一个 native
+frame owner，不复制 YUV surface。ROS2 `TypeAdapter` 只在需要 ROS 消息或跨进程传输时复制
+时间戳、源帧序号、分辨率和 stride 等元数据。
+
+每个订阅者的 intra-process 队列各自持有一份 packet，但只增加 shared pointer 引用计数。
+消息被处理或从 keep-last 队列淘汰后，最后一个引用会自动释放 Argus frame，因此不再需要
+显式的 buffer id、lease 或固定消费者注册。
+
+native frame owner 是进程内句柄，不能拿到另一个独立进程中使用；跨进程订阅者只能收到
+`ArgusYuvFrame` 的元数据。如果未来需要跨进程传输 YUV，需要另行实现 dmabuf/共享内存
+传输协议或采用支持 GPU buffer 的消息类型。
+
+`yuv_inference_node` 只加载已构建好的 YOLOv8-seg TensorRT engine，不包含 ONNX 解析或
+engine 构建逻辑。它复用同一份 Argus native frame，将其复制到可复用的 NVMM YUV dmabuf，
+经 VIC 转为 RGBA；随后通过 `NvBufSurfaceMapEglImage` 和 CUDA EGL interop 取得 RGBA
+device pointer，由 CUDA kernel 完成双线性 letterbox、RGB 排列、CHW 与 `[0, 1]` 归一化，
+并直接写入 TensorRT input buffer。图像不映射到 CPU，也没有 host-to-device 输入复制。
+检测头和 mask prototype 在节点内
+完成类别 NMS、坐标反变换与实例掩码解码；只有模型输出和最终发布的分割结果会回到 CPU。
+可视化节点直接从同一 Argus frame 复制到 JPEG 编码器所需的 dmabuf，发布压缩图像。
+
+分割结果发布到 `/camera/inference/segmentation`，类型为
+`argus_interfaces/msg/ArgusInferenceResult`。结果沿用采集帧的 `header` 和 `frame_number`，
+并包含图像尺寸、端到端推理处理时延和每个实例的类别、置信度、原图坐标框。每个实例的
+`mask` 是其 bounding-box ROI 的行优先 `mono8` 二值掩码；用 `mask_x`、`mask_y`、
+`mask_width` 和 `mask_height` 即可投回原图。
+
+默认 engine 是 `/home/royfan/yolov8_trt/yolov8s-seg-640.engine`，profile 固定为
+`1x3x640x640`。engine 必须在目标 Jetson 上离线构建；节点启动时只反序列化并加载该文件，
+若文件缺失或与目标平台/TensorRT 版本不兼容，节点会立即报错退出。可通过以下参数调整：
+
+```text
+input_topic, output_topic
+engine_path, input_size
+confidence_threshold, iou_threshold
+```
+
+本机离线生成默认 engine 使用的命令如下；`--noTF32` 避开当前 TensorRT 10.16 安装中 FP16
+CASK tactic 的 shader 断言：
+
+```bash
+trtexec --onnx=/home/royfan/yolov8_trt/yolov8s-seg.onnx \
+  --saveEngine=/home/royfan/yolov8_trt/yolov8s-seg-640.engine \
+  --noTF32 --memPoolSize=workspace:1024 \
+  --minShapes=images:1x3x640x640 \
+  --optShapes=images:1x3x640x640 \
+  --maxShapes=images:1x3x640x640 \
+  --builderOptimizationLevel=0 --avgTiming=1 --skipInference
+```
+
+不同 GPU 或 TensorRT 版本生成的 engine 不应互相复用；请在部署目标上运行上面的离线命令，
+然后通过 `engine_path` 指向生成文件。
+
+启动整个管线：
+
+```bash
+ros2 launch argus_bringup argus_pipeline.launch.py
+```
+
+组件默认按 inference、visualization、camera 顺序加载；相机组件不等待订阅者发现即可开始
+采集。以下常用参数可在 launch 命令中传入：
+
+```bash
+ros2 launch argus_bringup argus_pipeline.launch.py \
+  camera_index:=0 sensor_mode_index:=0 frame_count:=100 \
+  fifo_length:=8 frame_id:=camera
+```
+
+`camera_index` 和 `sensor_mode_index` 分别选择 LibArgus 枚举到的摄像头与 sensor mode；
+`frame_count=0` 表示持续采集。采集节点还提供以下启动参数，适合写入 ROS 参数 YAML：
+
+```text
+topic, frame_id, frame_count, camera_index, sensor_mode_index, fifo_length
+saturation, exposure_compensation, isp_digital_gain
+denoise_mode (off|fast|hq), denoise_strength
+edge_enhance_mode (off|fast|hq), edge_enhance_strength
+manual_white_balance, white_balance_gains: [r, g_even, g_odd, b]
+```
+
+这些参数在组件启动时应用到 Argus request；运行中不再读取终端标准输入。
+
+查看可视化输出：
+
+```bash
+ros2 topic echo /camera/image/compressed --once
+ros2 run rqt_image_view rqt_image_view
+```
+
+自定义 YUV handle topic 使用 reliable/keep-last（深度 8）；intra-process communication
+要求使用 keep-last 历史策略。JPEG 输出使用 `SensorDataQoS`（best effort）。Argus EGLStream
+FIFO 默认长度也是 8，可使用 `fifo_length` 修改；应结合实际处理时延与允许的帧数延迟调整。
+
+YUV packet 使用 keep-last 队列；如果消费者处理速度低于采集速度，最旧的 packet 会被淘汰，
+其 shared owner 随之释放 Argus Frame，避免 native buffer 永久滞留。慢消费者仍会对 EGLStream
+形成背压，因此队列深度应与 Argus FIFO 长度和处理耗时匹配。
+
+消息头时间戳取自 `ICaptureMetadata::getSensorTimestamp()`，即 Argus 报告的传感器时间戳
+（纳秒）。该时间通常属于系统单调时钟域，不等同于 ROS 的 `/clock` 时间；与其他传感器
+做时间同步时，应确保它们使用相同时间基准或在上层完成时钟转换。
+
+`ArgusYuvFrame.frame_number` 由采集节点直接写入 `EGLStream::IFrame::getNumber()`；推理和
+可视化等下游节点只读取/透传该源帧序号，不在各自节点重新计数。`CompressedImage` 是标准
+消息且没有帧序号字段，需通过其继承的时间戳与 YUV packet 关联。
+
+不同 Jetson/传感器对 ISP 数字增益、色彩饱和度和手动白平衡的支持范围可能不同；如果驱动
+拒绝某项启动参数，程序会打印 Argus status 并退出。

@@ -1,0 +1,54 @@
+# ROS 2 / colcon build artifacts
+/build/
+/install/
+/log/
+/symlink_install_manifest.txt
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+Testing/
+CTestTestfile.cmake
+CTestConfiguration.ini
+install_manifest.txt
+
+# Python generated files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Native build outputs
+*.o
+*.obj
+*.so
+*.so.*
+*.a
+*.lib
+*.dll
+*.dylib
+*.exe
+
+# CUDA build outputs
+*.ptx
+*.cubin
+*.fatbin
+
+# Runtime data and local logs
+*.log
+*.bag
+*.db3
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Operating system files
+.DS_Store
+Thumbs.db

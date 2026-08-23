@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>argus_bringup</name>
+  <version>0.1.0</version>
+  <description>Composable LibArgus pipeline launch files.</description>
+  <maintainer email="maintainer@example.com">libargus_demo maintainers</maintainer>
+  <license>Apache-2.0</license>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>argus_camera</exec_depend>
+  <exec_depend>argus_inference</exec_depend>
+  <exec_depend>argus_visualization</exec_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>
