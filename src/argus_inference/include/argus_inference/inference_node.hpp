@@ -29,6 +29,12 @@ public:
     ~InferenceNode() override;
 
 private:
+    struct PreprocessTiming {
+        float rgbaClearMs = 0.0F;
+        float yuvTransformMs = 0.0F;
+        float eglCudaInteropMs = 0.0F;
+    };
+
     struct StagingSlot {
         enum class State {
             kFree,
@@ -54,7 +60,8 @@ private:
     void inferenceLoop();
     void inferFrame(size_t slotIndex);
     bool copyFrameToYuvBuffer(const argus_transport::ArgusFramePacket& packet, StagingSlot* slot);
-    bool copyYuvToRgbaGpu(StagingSlot* slot, void** rgbaDevice, size_t* sourcePitch);
+    bool copyYuvToRgbaGpu(StagingSlot* slot, void** rgbaDevice, size_t* sourcePitch,
+                          PreprocessTiming* timing);
     bool ensureSlotSurfaces(StagingSlot* slot, uint32_t width, uint32_t height);
     void releaseSlotCudaInterop(StagingSlot* slot);
     void releaseSlot(StagingSlot* slot);
@@ -66,6 +73,7 @@ private:
     std::unique_ptr<YoloV8Segmentation> model_;
     std::string inputTopic_;
     int inputSize_ = 640;
+    uint64_t timingLogEveryNFrames_ = 30;
     float confidenceThreshold_ = 0.25F;
     float iouThreshold_ = 0.45F;
     std::vector<StagingSlot> frameSlots_;

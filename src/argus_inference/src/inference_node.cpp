@@ -28,12 +28,15 @@ InferenceNode::InferenceNode(const rclcpp::NodeOptions& options)
     inputSize_ = declare_parameter<int>("input_size", 640);
     const auto requireFp16Engine = declare_parameter<bool>("require_fp16_engine", true);
     const auto stagingBufferCount = declare_parameter<int>("staging_buffer_count", 3);
+    const auto timingLogEveryNFrames = declare_parameter<int>("timing_log_every_n_frames", 30);
     confidenceThreshold_ = static_cast<float>(declare_parameter<double>("confidence_threshold", 0.25));
     iouThreshold_ = static_cast<float>(declare_parameter<double>("iou_threshold", 0.45));
-    if (inputSize_ <= 0 || stagingBufferCount < 2 || confidenceThreshold_ < 0.0F || confidenceThreshold_ > 1.0F ||
+    if (inputSize_ <= 0 || stagingBufferCount < 2 || timingLogEveryNFrames <= 0 ||
+        confidenceThreshold_ < 0.0F || confidenceThreshold_ > 1.0F ||
         iouThreshold_ < 0.0F || iouThreshold_ > 1.0F) {
         throw std::invalid_argument("TensorRT inference parameter is invalid");
     }
+    timingLogEveryNFrames_ = static_cast<uint64_t>(timingLogEveryNFrames);
 
     model_ = std::make_unique<YoloV8Segmentation>();
     if (!model_->initialize(enginePath, inputSize_, requireFp16Engine)) {
@@ -111,9 +114,12 @@ bool InferenceNode::copyFrameToYuvBuffer(const argus_transport::ArgusFramePacket
     return true;
 }
 
-bool InferenceNode::copyYuvToRgbaGpu(StagingSlot* slot, void** rgbaDevice, size_t* sourcePitch) {
+bool InferenceNode::copyYuvToRgbaGpu(StagingSlot* slot, void** rgbaDevice, size_t* sourcePitch,
+                                      PreprocessTiming* timing) {
     if (!slot || !rgbaDevice || !sourcePitch || slot->yuvDmabuf < 0 || slot->rgbaDmabuf < 0) return false;
+    if (timing) *timing = {};
 
+    const auto rgbaClearStart = std::chrono::steady_clock::now();
     NvBufSurface* surface = nullptr;
     if (NvBufSurfaceFromFd(slot->rgbaDmabuf, reinterpret_cast<void**>(&surface)) != 0 || !surface) {
         RCLCPP_ERROR(get_logger(), "从 RGBA dmabuf 获取 NvBufSurface 失败");
@@ -141,6 +147,10 @@ bool InferenceNode::copyYuvToRgbaGpu(StagingSlot* slot, void** rgbaDevice, size_
         return false;
     }
     NvBufSurfaceUnMap(surface, 0, 0);
+    if (timing) {
+        timing->rgbaClearMs = static_cast<float>(std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - rgbaClearStart).count());
+    }
 
     NvBufSurf::NvCommonTransformParams transform{};
     transform.src_width = slot->width;
@@ -155,10 +165,17 @@ bool InferenceNode::copyYuvToRgbaGpu(StagingSlot* slot, void** rgbaDevice, size_
         NVBUFSURF_TRANSFORM_FILTER | NVBUFSURF_TRANSFORM_CROP_DST);
     transform.flip = NvBufSurfTransform_None;
     transform.filter = NvBufSurfTransformInter_Algo3;
+    const auto transformStart = std::chrono::steady_clock::now();
     if (NvBufSurf::NvTransform(&transform, slot->yuvDmabuf, slot->rgbaDmabuf) != 0) {
         RCLCPP_ERROR(get_logger(), "YUV 转 RGBA 失败");
         return false;
     }
+    if (timing) {
+        timing->yuvTransformMs = static_cast<float>(std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - transformStart).count());
+    }
+
+    const auto eglCudaInteropStart = std::chrono::steady_clock::now();
     if (NvBufSurfaceMapEglImage(surface, 0) != 0) {
         RCLCPP_ERROR(get_logger(), "创建 RGBA EGL image 失败");
         return false;
@@ -192,6 +209,10 @@ bool InferenceNode::copyYuvToRgbaGpu(StagingSlot* slot, void** rgbaDevice, size_
     slot->mappedRgbaSurface = surface;
     *rgbaDevice = eglFrame.frame.pPitch[0];
     *sourcePitch = eglFrame.pitch;
+    if (timing) {
+        timing->eglCudaInteropMs = static_cast<float>(std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - eglCudaInteropStart).count());
+    }
     return true;
 }
 
@@ -304,25 +325,30 @@ void InferenceNode::inferFrame(size_t slotIndex) {
     void* rgbaDevice = nullptr;
     size_t sourcePitch = 0;
     auto& slot = frameSlots_[slotIndex];
-    if (!copyYuvToRgbaGpu(&slot, &rgbaDevice, &sourcePitch)) return;
+    PreprocessTiming preprocessTiming;
+    if (!copyYuvToRgbaGpu(&slot, &rgbaDevice, &sourcePitch, &preprocessTiming)) return;
     std::vector<SegmentationInstance> instances;
-    const auto inferenceStart = std::chrono::steady_clock::now();
+    const auto modelStart = std::chrono::steady_clock::now();
     const bool inferred = model_->infer(rgbaDevice, sourcePitch, slot.width, slot.height, inputSize_, inputSize_,
                                         confidenceThreshold_, iouThreshold_, &instances);
+    const float modelMs = static_cast<float>(std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - modelStart).count());
+    const auto interopReleaseStart = std::chrono::steady_clock::now();
     releaseSlotCudaInterop(&slot);
+    const float interopReleaseMs = static_cast<float>(std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - interopReleaseStart).count());
     if (!inferred) {
         RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000, "YOLOv8-seg TensorRT 推理失败");
         return;
     }
-    const float inferenceMs = static_cast<float>(std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - inferenceStart).count());
 
+    const auto publishStart = std::chrono::steady_clock::now();
     argus_interfaces::msg::ArgusInferenceResult result;
     result.header = slot.header;
     result.frame_number = slot.frameNumber;
     result.image_width = slot.width;
     result.image_height = slot.height;
-    result.inference_ms = inferenceMs;
+    result.inference_ms = modelMs;
     result.instances.reserve(instances.size());
     for (const auto& instance : instances) {
         argus_interfaces::msg::ArgusInstanceSegmentation message;
@@ -344,17 +370,24 @@ void InferenceNode::inferFrame(size_t slotIndex) {
         result.instances.push_back(std::move(message));
     }
     publisher_->publish(std::move(result));
+    const float publishMs = static_cast<float>(std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - publishStart).count());
     ++processedFrames_;
-    const float processingMs = static_cast<float>(std::chrono::duration<double, std::milli>(
+    const float workerMs = static_cast<float>(std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - processingStart).count());
     const float queueMs = static_cast<float>(std::chrono::duration<double, std::milli>(
         processingStart - slot.enqueuedAt).count());
-    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
-                         "已发布推理结果 #%lu（源帧 #%lu，%zu 个实例；暂存 %.1f ms，排队 %.1f ms，推理 %.1f ms，处理 %.1f ms；丢弃 %lu，替换旧帧 %lu）",
-                         static_cast<unsigned long>(processedFrames_),
-                         static_cast<unsigned long>(slot.frameNumber), instances.size(), slot.stagingMs,
-                         queueMs, inferenceMs, processingMs, static_cast<unsigned long>(droppedFrames_.load()),
-                         static_cast<unsigned long>(supersededFrames_.load()));
+    if (processedFrames_ % timingLogEveryNFrames_ == 0) {
+        const float endToEndMs = slot.stagingMs + queueMs + workerMs;
+        RCLCPP_INFO(
+            get_logger(),
+            "性能 #%lu（源帧 #%lu，%ux%u，%zu 个实例）：Argus→YUV %.1f ms，排队 %.1f ms，RGBA 清屏 %.1f ms，YUV→RGBA %.1f ms，EGL/CUDA 映射 %.1f ms，模型端到端 %.1f ms，EGL/CUDA 释放 %.1f ms，结果组包+发布 %.1f ms，worker %.1f ms，端到端 %.1f ms；丢弃 %lu，替换旧帧 %lu",
+            static_cast<unsigned long>(processedFrames_), static_cast<unsigned long>(slot.frameNumber),
+            slot.width, slot.height, instances.size(), slot.stagingMs, queueMs, preprocessTiming.rgbaClearMs,
+            preprocessTiming.yuvTransformMs, preprocessTiming.eglCudaInteropMs, modelMs, interopReleaseMs,
+            publishMs, workerMs, endToEndMs, static_cast<unsigned long>(droppedFrames_.load()),
+            static_cast<unsigned long>(supersededFrames_.load()));
+    }
 }
 
 }  // namespace argus_inference

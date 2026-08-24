@@ -45,7 +45,7 @@ def generate_launch_description():
     )
     return LaunchDescription([
         DeclareLaunchArgument('camera_index', default_value='0'),
-        DeclareLaunchArgument('sensor_mode_index', default_value='0'),
+        DeclareLaunchArgument('sensor_mode_index', default_value='4'),
         DeclareLaunchArgument('frame_count', default_value='0'),
         DeclareLaunchArgument('fifo_length', default_value='8'),
         DeclareLaunchArgument('frame_id', default_value='camera'),

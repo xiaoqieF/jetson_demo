@@ -97,10 +97,19 @@ bool ArgusCameraNode::start() {
         !continuous_capture::ok(properties->getAllSensorModes(&modes), "枚举 sensor mode 失败") ||
         !continuous_capture::check(sensorModeIndex_ < static_cast<int>(modes.size()),
                                    "sensor_mode_index 超出可用 sensor mode 范围")) return false;
+    for (size_t index = 0; index < modes.size(); ++index) {
+        auto* modeInterface = Argus::interface_cast<Argus::ISensorMode>(modes[index]);
+        if (!modeInterface) continue;
+        const auto modeResolution = modeInterface->getResolution();
+        RCLCPP_INFO(get_logger(), "sensor_mode_index=%zu：%ux%u", index,
+                    modeResolution.width(), modeResolution.height());
+    }
     sensorMode_ = modes[sensorModeIndex_];
     auto* sensorModeInterface = Argus::interface_cast<Argus::ISensorMode>(sensorMode_);
     if (!continuous_capture::check(sensorModeInterface != nullptr, "无法获取 sensor mode 接口")) return false;
     resolution_ = sensorModeInterface->getResolution();
+    RCLCPP_INFO(get_logger(), "已选择 sensor_mode_index=%d，YUV 输出分辨率=%ux%u",
+                sensorModeIndex_, resolution_.width(), resolution_.height());
 
     Argus::Status status = Argus::STATUS_OK;
     session_.reset(iProvider_->createCaptureSession(device, &status));
