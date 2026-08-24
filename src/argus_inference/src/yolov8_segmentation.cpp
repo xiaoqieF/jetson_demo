@@ -52,7 +52,8 @@ std::string className(int classId) {
 }
 
 struct LetterboxInfo {
-    float scale = 1.0F;
+    float scaleX = 1.0F;
+    float scaleY = 1.0F;
     int paddingX = 0;
     int paddingY = 0;
 };
@@ -182,16 +183,18 @@ void YoloV8Segmentation::releaseBuffers() {
 }
 
 bool YoloV8Segmentation::infer(const void* rgbaDevice, size_t sourcePitch, int sourceWidth,
-                                int sourceHeight, float confidenceThreshold, float iouThreshold,
+                                int sourceHeight, int rgbaWidth, int rgbaHeight,
+                                float confidenceThreshold, float iouThreshold,
                                 std::vector<SegmentationInstance>* instances) {
     if (!instances || !initialized_ || !rgbaDevice || sourceWidth <= 0 || sourceHeight <= 0 ||
-        confidenceThreshold < 0.0F || iouThreshold < 0.0F) return false;
+        rgbaWidth <= 0 || rgbaHeight <= 0 || confidenceThreshold < 0.0F || iouThreshold < 0.0F) return false;
     instances->clear();
     const float scale = std::min(static_cast<float>(inputSize_) / sourceWidth,
                                  static_cast<float>(inputSize_) / sourceHeight);
-    const LetterboxInfo letterbox{scale, (inputSize_ - static_cast<int>(std::round(sourceWidth * scale))) / 2,
+    const LetterboxInfo letterbox{scale, scale,
+                                  (inputSize_ - static_cast<int>(std::round(sourceWidth * scale))) / 2,
                                   (inputSize_ - static_cast<int>(std::round(sourceHeight * scale))) / 2};
-    if (!preprocessRgbaOnGpu(rgbaDevice, sourcePitch, sourceWidth, sourceHeight,
+    if (!preprocessRgbaOnGpu(rgbaDevice, sourcePitch, rgbaWidth, rgbaHeight,
                              static_cast<float*>(input_.device), inputSize_, stream_) ||
         !context_->setInputTensorAddress(input_.name.c_str(), input_.device)) return false;
     for (const auto& output : outputs_) {
@@ -238,10 +241,10 @@ bool YoloV8Segmentation::infer(const void* rgbaDevice, size_t sourcePitch, int s
         const float centerY = outputAt(head, predictions, prediction, 1);
         const float width = outputAt(head, predictions, prediction, 2);
         const float height = outputAt(head, predictions, prediction, 3);
-        const int left = std::clamp(static_cast<int>(std::floor((centerX - width * 0.5F - letterbox.paddingX) / letterbox.scale)), 0, sourceWidth);
-        const int top = std::clamp(static_cast<int>(std::floor((centerY - height * 0.5F - letterbox.paddingY) / letterbox.scale)), 0, sourceHeight);
-        const int right = std::clamp(static_cast<int>(std::ceil((centerX + width * 0.5F - letterbox.paddingX) / letterbox.scale)), 0, sourceWidth);
-        const int bottom = std::clamp(static_cast<int>(std::ceil((centerY + height * 0.5F - letterbox.paddingY) / letterbox.scale)), 0, sourceHeight);
+        const int left = std::clamp(static_cast<int>(std::floor((centerX - width * 0.5F - letterbox.paddingX) / letterbox.scaleX)), 0, sourceWidth);
+        const int top = std::clamp(static_cast<int>(std::floor((centerY - height * 0.5F - letterbox.paddingY) / letterbox.scaleY)), 0, sourceHeight);
+        const int right = std::clamp(static_cast<int>(std::ceil((centerX + width * 0.5F - letterbox.paddingX) / letterbox.scaleX)), 0, sourceWidth);
+        const int bottom = std::clamp(static_cast<int>(std::ceil((centerY + height * 0.5F - letterbox.paddingY) / letterbox.scaleY)), 0, sourceHeight);
         if (right <= left || bottom <= top) continue;
         Candidate candidate;
         candidate.instance = SegmentationInstance{classId, className(classId), confidence,

@@ -29,7 +29,7 @@ public:
 
     bool initialize(const std::string& enginePath, int inputSize, bool requireFp16);
     bool infer(const void* rgbaDevice, size_t sourcePitch, int sourceWidth, int sourceHeight,
-               float confidenceThreshold, float iouThreshold,
+               int rgbaWidth, int rgbaHeight, float confidenceThreshold, float iouThreshold,
                std::vector<SegmentationInstance>* instances);
 
     int inputSize() const { return inputSize_; }
