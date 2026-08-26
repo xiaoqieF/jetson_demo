@@ -2,9 +2,6 @@
 
 #include "argus_inference/yolov8_segmentation.hpp"
 
-#include <EGLStream/Frame.h>
-#include <EGLStream/Image.h>
-#include <EGLStream/NV/ImageNativeBuffer.h>
 #include <NvBufSurface.h>
 #include <nvbufsurface.h>
 
@@ -14,6 +11,7 @@
 #include <chrono>
 #include <algorithm>
 #include <cmath>
+#include <rclcpp/logging.hpp>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -81,75 +79,51 @@ bool InferenceNode::ensureSlotSurfaces(StagingSlot* slot, uint32_t width, uint32
         slot->rgbaDmabuf = -1;
         return false;
     }
+    slot->rgbaInitialized = false;
     slot->width = width;
     slot->height = height;
     return true;
 }
 
-bool InferenceNode::copyFrameToYuvBuffer(const argus_transport::ArgusFramePacket& packet, StagingSlot* slot) {
-    if (!packet.frame || !slot || packet.width == 0 || packet.height == 0) return false;
-    auto* iFrame = Argus::interface_cast<EGLStream::IFrame>(static_cast<Argus::InterfaceProvider*>(packet.frame->get()));
-    auto* image = iFrame ? iFrame->getImage() : nullptr;
-    auto* nativeBuffer = image ? Argus::interface_cast<EGLStream::NV::IImageNativeBuffer>(image) : nullptr;
-    if (!nativeBuffer) {
-        RCLCPP_ERROR(get_logger(), "Argus image 不支持 native buffer");
-        return false;
-    }
-    if (packet.width != slot->width || packet.height != slot->height || slot->yuvDmabuf < 0) {
-        releaseSlot(slot);
-        slot->yuvDmabuf = nativeBuffer->createNvBuffer(Argus::Size2D<uint32_t>(packet.width, packet.height),
-                                                  NVBUF_COLOR_FORMAT_YUV420, NVBUF_LAYOUT_PITCH);
-        if (slot->yuvDmabuf < 0) {
-            RCLCPP_ERROR(get_logger(), "创建 YUV 推理 dmabuf 失败");
-            return false;
-        }
-        if (!ensureSlotSurfaces(slot, packet.width, packet.height)) {
-            releaseSlot(slot);
-            return false;
-        }
-    } else if (nativeBuffer->copyToNvBuffer(slot->yuvDmabuf) != Argus::STATUS_OK) {
-        RCLCPP_ERROR(get_logger(), "复制 Argus image 到推理 dmabuf 失败");
-        return false;
-    }
-    return true;
-}
-
 bool InferenceNode::copyYuvToRgbaGpu(StagingSlot* slot, void** rgbaDevice, size_t* sourcePitch,
                                       PreprocessTiming* timing) {
-    if (!slot || !rgbaDevice || !sourcePitch || slot->yuvDmabuf < 0 || slot->rgbaDmabuf < 0) return false;
+    if (!slot || !rgbaDevice || !sourcePitch || !slot->sourceFrame || slot->rgbaDmabuf < 0) return false;
     if (timing) *timing = {};
 
-    const auto rgbaClearStart = std::chrono::steady_clock::now();
     NvBufSurface* surface = nullptr;
     if (NvBufSurfaceFromFd(slot->rgbaDmabuf, reinterpret_cast<void**>(&surface)) != 0 || !surface) {
         RCLCPP_ERROR(get_logger(), "从 RGBA dmabuf 获取 NvBufSurface 失败");
         return false;
     }
-    if (NvBufSurfaceMap(surface, 0, 0, NVBUF_MAP_WRITE) != 0) {
-        RCLCPP_ERROR(get_logger(), "映射 RGBA dmabuf 失败");
-        return false;
-    }
-    auto* mapped = static_cast<uint32_t*>(surface->surfaceList[0].mappedAddr.addr[0]);
-    if (!mapped) {
+    if (!slot->rgbaInitialized) {
+        const auto rgbaClearStart = std::chrono::steady_clock::now();
+        if (NvBufSurfaceMap(surface, 0, 0, NVBUF_MAP_WRITE) != 0) {
+            RCLCPP_ERROR(get_logger(), "映射 RGBA dmabuf 失败");
+            return false;
+        }
+        auto* mapped = static_cast<uint32_t*>(surface->surfaceList[0].mappedAddr.addr[0]);
+        if (!mapped) {
+            NvBufSurfaceUnMap(surface, 0, 0);
+            RCLCPP_ERROR(get_logger(), "获取 RGBA dmabuf CPU 地址失败");
+            return false;
+        }
+        constexpr uint32_t kLetterboxRgba = 0xFF727272U;
+        const size_t pixelsPerRow = surface->surfaceList[0].pitch / sizeof(uint32_t);
+        for (uint32_t row = 0; row < static_cast<uint32_t>(inputSize_); ++row) {
+            std::fill_n(mapped + static_cast<size_t>(row) * pixelsPerRow,
+                        static_cast<size_t>(inputSize_), kLetterboxRgba);
+        }
+        if (NvBufSurfaceSyncForDevice(surface, 0, 0) != 0) {
+            NvBufSurfaceUnMap(surface, 0, 0);
+            RCLCPP_ERROR(get_logger(), "同步 RGBA dmabuf 到设备失败");
+            return false;
+        }
         NvBufSurfaceUnMap(surface, 0, 0);
-        RCLCPP_ERROR(get_logger(), "获取 RGBA dmabuf CPU 地址失败");
-        return false;
-    }
-    constexpr uint32_t kLetterboxRgba = 0xFF727272U;
-    const size_t pixelsPerRow = surface->surfaceList[0].pitch / sizeof(uint32_t);
-    for (uint32_t row = 0; row < static_cast<uint32_t>(inputSize_); ++row) {
-        std::fill_n(mapped + static_cast<size_t>(row) * pixelsPerRow,
-                    static_cast<size_t>(inputSize_), kLetterboxRgba);
-    }
-    if (NvBufSurfaceSyncForDevice(surface, 0, 0) != 0) {
-        NvBufSurfaceUnMap(surface, 0, 0);
-        RCLCPP_ERROR(get_logger(), "同步 RGBA dmabuf 到设备失败");
-        return false;
-    }
-    NvBufSurfaceUnMap(surface, 0, 0);
-    if (timing) {
-        timing->rgbaClearMs = static_cast<float>(std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - rgbaClearStart).count());
+        slot->rgbaInitialized = true;
+        if (timing) {
+            timing->rgbaClearMs = static_cast<float>(std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - rgbaClearStart).count());
+        }
     }
 
     NvBufSurf::NvCommonTransformParams transform{};
@@ -164,12 +138,28 @@ bool InferenceNode::copyYuvToRgbaGpu(StagingSlot* slot, void** rgbaDevice, size_
     transform.flag = static_cast<NvBufSurfTransform_Transform_Flag>(
         NVBUFSURF_TRANSFORM_FILTER | NVBUFSURF_TRANSFORM_CROP_DST);
     transform.flip = NvBufSurfTransform_None;
-    transform.filter = NvBufSurfTransformInter_Algo3;
+    transform.filter = NvBufSurfTransformInter_Bilinear;
     const auto transformStart = std::chrono::steady_clock::now();
-    if (NvBufSurf::NvTransform(&transform, slot->yuvDmabuf, slot->rgbaDmabuf) != 0) {
-        RCLCPP_ERROR(get_logger(), "YUV 转 RGBA 失败");
+    const int sourceDmabuf = slot->sourceFrame->dmabuf();
+    NvBufSurface* sourceSurface = nullptr;
+    if (NvBufSurfaceFromFd(sourceDmabuf, reinterpret_cast<void**>(&sourceSurface)) != 0 || !sourceSurface) {
+        RCLCPP_ERROR(get_logger(), "从采集 dmabuf 获取 NvBufSurface 失败 (fd=%d)", sourceDmabuf);
         return false;
     }
+    const int transformResult = NvBufSurf::NvTransform(&transform, sourceDmabuf, slot->rgbaDmabuf);
+    if (transformResult != 0) {
+        const auto& source = sourceSurface->surfaceList[0];
+        const auto& destination = surface->surfaceList[0];
+        RCLCPP_ERROR(
+            get_logger(),
+            "YUV 转 RGBA 失败 (status=%d, src fd=%d %ux%u format=%d layout=%d planes=%u, dst fd=%d %ux%u format=%d layout=%d)",
+            transformResult, sourceDmabuf, source.width, source.height,
+            static_cast<int>(source.colorFormat), static_cast<int>(source.layout),
+            source.planeParams.num_planes, slot->rgbaDmabuf, destination.width, destination.height,
+            static_cast<int>(destination.colorFormat), static_cast<int>(destination.layout));
+        return false;
+    }
+    slot->sourceFrame.reset();
     if (timing) {
         timing->yuvTransformMs = static_cast<float>(std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - transformStart).count());
@@ -231,12 +221,12 @@ void InferenceNode::releaseSlotCudaInterop(StagingSlot* slot) {
 void InferenceNode::releaseSlot(StagingSlot* slot) {
     if (!slot) return;
     releaseSlotCudaInterop(slot);
-    if (slot->yuvDmabuf >= 0) NvBufSurf::NvDestroy(slot->yuvDmabuf);
     if (slot->rgbaDmabuf >= 0) NvBufSurf::NvDestroy(slot->rgbaDmabuf);
-    slot->yuvDmabuf = -1;
     slot->rgbaDmabuf = -1;
+    slot->rgbaInitialized = false;
     slot->width = 0;
     slot->height = 0;
+    slot->sourceFrame.reset();
 }
 
 bool InferenceNode::reserveSlot(size_t* slotIndex) {
@@ -262,6 +252,7 @@ bool InferenceNode::reserveSlot(size_t* slotIndex) {
 
 void InferenceNode::releaseSlotForReuse(size_t slotIndex) {
     std::lock_guard<std::mutex> lock(jobsMutex_);
+    frameSlots_[slotIndex].sourceFrame.reset();
     frameSlots_[slotIndex].state = StagingSlot::State::kFree;
 }
 
@@ -283,10 +274,11 @@ void InferenceNode::stageFrame(argus_transport::ArgusFramePacket::ConstSharedPtr
     slot.header = packet->header;
     slot.frameNumber = packet->frame_number;
     const auto stagingStart = std::chrono::steady_clock::now();
-    if (!copyFrameToYuvBuffer(*packet, &slot)) {
+    if (!ensureSlotSurfaces(&slot, packet->width, packet->height)) {
         releaseSlotForReuse(slotIndex);
         return;
     }
+    slot.sourceFrame = packet->frame;
     slot.stagingMs = static_cast<float>(std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - stagingStart).count());
     slot.enqueuedAt = std::chrono::steady_clock::now();

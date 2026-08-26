@@ -22,7 +22,7 @@ VisualizationNode::VisualizationNode(const rclcpp::NodeOptions& options)
     subscription_ = create_subscription<argus_transport::ArgusFramePacket>(
         inputTopic, rclcpp::QoS(rclcpp::KeepLast(8)).reliable(),
         [this](argus_transport::ArgusFramePacket::ConstSharedPtr message) {
-            publishJpeg(*message);
+            // publishJpeg(*message);
         });
 }
 
@@ -38,7 +38,7 @@ void VisualizationNode::publishJpeg(
     }
     std::vector<uint8_t> jpeg;
     if (!argus_pipeline::encodeFrameToJpeg(
-            packet.frame->get(), encoder_.get(), &dmabuf_, packet.width, packet.height, &jpeg)) return;
+            packet.frame->dmabuf(), encoder_.get(), packet.width, packet.height, &jpeg)) return;
     sensor_msgs::msg::CompressedImage compressed;
     compressed.header = packet.header;
     compressed.format = "jpeg";

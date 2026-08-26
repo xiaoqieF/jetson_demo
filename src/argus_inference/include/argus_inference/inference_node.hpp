@@ -43,10 +43,11 @@ private:
             kProcessing,
         };
 
-        int yuvDmabuf = -1;
         int rgbaDmabuf = -1;
+        bool rgbaInitialized = false;
         uint32_t width = 0;
         uint32_t height = 0;
+        std::shared_ptr<argus_transport::ArgusFrameOwner> sourceFrame;
         void* mappedRgbaSurface = nullptr;
         CUgraphicsResource mappedRgbaResource = nullptr;
         std_msgs::msg::Header header;
@@ -59,7 +60,6 @@ private:
     void stageFrame(argus_transport::ArgusFramePacket::ConstSharedPtr packet);
     void inferenceLoop();
     void inferFrame(size_t slotIndex);
-    bool copyFrameToYuvBuffer(const argus_transport::ArgusFramePacket& packet, StagingSlot* slot);
     bool copyYuvToRgbaGpu(StagingSlot* slot, void** rgbaDevice, size_t* sourcePitch,
                           PreprocessTiming* timing);
     bool ensureSlotSurfaces(StagingSlot* slot, uint32_t width, uint32_t height);

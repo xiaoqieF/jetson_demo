@@ -3,9 +3,9 @@
 #include <argus_interfaces/msg/argus_yuv_frame.hpp>
 
 #include <Argus/Argus.h>
-#include <EGLStream/EGLStream.h>
 
 #include <cstdint>
+#include <mutex>
 #include <memory>
 #include <string>
 #include <utility>
@@ -15,15 +15,44 @@
 
 namespace argus_transport {
 
-class ArgusFrameOwner {
+class ArgusBufferReleaseState final {
 public:
-    explicit ArgusFrameOwner(Argus::UniqueObj<EGLStream::Frame>&& frame)
-        : frame_(std::move(frame)) {}
+    void setStream(Argus::IBufferOutputStream* stream) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stream_ = stream;
+    }
 
-    EGLStream::Frame* get() const { return frame_.get(); }
+    void disable() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stream_ = nullptr;
+    }
+
+    void release(Argus::Buffer* buffer) noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (stream_ && buffer) stream_->releaseBuffer(buffer);
+    }
 
 private:
-    Argus::UniqueObj<EGLStream::Frame> frame_;
+    std::mutex mutex_;
+    Argus::IBufferOutputStream* stream_ = nullptr;
+};
+
+class ArgusFrameOwner {
+public:
+    ArgusFrameOwner(int dmabuf, Argus::Buffer* buffer,
+                    std::shared_ptr<ArgusBufferReleaseState> releaseState)
+        : dmabuf_(dmabuf), buffer_(buffer), releaseState_(std::move(releaseState)) {}
+
+    ~ArgusFrameOwner() {
+        if (releaseState_) releaseState_->release(buffer_);
+    }
+
+    int dmabuf() const { return dmabuf_; }
+
+private:
+    int dmabuf_ = -1;
+    Argus::Buffer* buffer_ = nullptr;
+    std::shared_ptr<ArgusBufferReleaseState> releaseState_;
 };
 
 struct ArgusFramePacket {
