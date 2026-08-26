@@ -123,7 +123,9 @@ device pointer，由 CUDA kernel 完成双线性 letterbox、RGB 排列、CHW �
 
 分割结果发布到 `/camera/inference/segmentation`，类型为
 `argus_interfaces/msg/ArgusInferenceResult`。结果沿用采集帧的 `header` 和 `frame_number`，
-并包含图像尺寸、端到端推理处理时延和每个实例的类别、置信度、原图坐标框。每个实例的
+并包含图像尺寸、模型处理端到端时延（`inference_ms`）和每个实例的类别、置信度、原图坐标框。
+节点按 `timing_log_every_n_frames` 输出 GPU 预处理、TensorRT 执行、输出回传、候选框解码、NMS
+和掩码解码的分段耗时。每个实例的
 `mask` 是其 bounding-box ROI 的行优先 `mono8` 二值掩码；用 `mask_x`、`mask_y`、
 `mask_width` 和 `mask_height` 即可投回原图。
 
@@ -134,6 +136,7 @@ device pointer，由 CUDA kernel 完成双线性 letterbox、RGB 排列、CHW �
 ```text
 input_topic, output_topic
 engine_path, input_size
+staging_buffer_count, timing_log_every_n_frames
 confidence_threshold, iou_threshold
 ```
 

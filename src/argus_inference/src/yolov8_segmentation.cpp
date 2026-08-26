@@ -6,6 +6,7 @@
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -67,11 +68,21 @@ float outputAt(const std::vector<float>& output, int predictions, int prediction
 YoloV8Segmentation::YoloV8Segmentation() {
     if (cudaStreamCreate(&stream_) != cudaSuccess) {
         stream_ = nullptr;
+        return;
+    }
+    if (cudaEventCreate(&gpuStartEvent_) != cudaSuccess ||
+        cudaEventCreate(&gpuPreprocessEvent_) != cudaSuccess ||
+        cudaEventCreate(&gpuInferenceEvent_) != cudaSuccess ||
+        cudaEventCreate(&gpuOutputCopyEvent_) != cudaSuccess) {
+        releaseTimingEvents();
+        cudaStreamDestroy(stream_);
+        stream_ = nullptr;
     }
 }
 
 YoloV8Segmentation::~YoloV8Segmentation() {
     releaseBuffers();
+    releaseTimingEvents();
     if (stream_) cudaStreamDestroy(stream_);
 }
 
@@ -82,7 +93,8 @@ void YoloV8Segmentation::Logger::log(Severity severity, const char* message) noe
 }
 
 bool YoloV8Segmentation::initialize(const std::string& enginePath, int inputSize, bool requireFp16) {
-    if (inputSize <= 0 || !stream_) return false;
+    if (inputSize <= 0 || !stream_ || !gpuStartEvent_ || !gpuPreprocessEvent_ ||
+        !gpuInferenceEvent_ || !gpuOutputCopyEvent_) return false;
     inputSize_ = inputSize;
     return loadEngine(enginePath, requireFp16);
 }
@@ -168,6 +180,10 @@ bool YoloV8Segmentation::configureTensors() {
         output.bytes = volume(output.dims) * sizeof(float);
         if (output.bytes == 0 || cudaMalloc(&output.device, output.bytes) != cudaSuccess) return false;
     }
+    hostOutputs_.resize(outputs_.size());
+    for (size_t index = 0; index < outputs_.size(); ++index) {
+        hostOutputs_[index].resize(outputs_[index].bytes / sizeof(float));
+    }
     initialized_ = true;
     return true;
 }
@@ -179,35 +195,62 @@ void YoloV8Segmentation::releaseBuffers() {
         if (output.device) cudaFree(output.device);
     }
     outputs_.clear();
+    hostOutputs_.clear();
     initialized_ = false;
+}
+
+void YoloV8Segmentation::releaseTimingEvents() {
+    if (gpuOutputCopyEvent_) cudaEventDestroy(gpuOutputCopyEvent_);
+    gpuOutputCopyEvent_ = nullptr;
+    if (gpuInferenceEvent_) cudaEventDestroy(gpuInferenceEvent_);
+    gpuInferenceEvent_ = nullptr;
+    if (gpuPreprocessEvent_) cudaEventDestroy(gpuPreprocessEvent_);
+    gpuPreprocessEvent_ = nullptr;
+    if (gpuStartEvent_) cudaEventDestroy(gpuStartEvent_);
+    gpuStartEvent_ = nullptr;
 }
 
 bool YoloV8Segmentation::infer(const void* rgbaDevice, size_t sourcePitch, int sourceWidth,
                                 int sourceHeight, int rgbaWidth, int rgbaHeight,
                                 float confidenceThreshold, float iouThreshold,
-                                std::vector<SegmentationInstance>* instances) {
+                                std::vector<SegmentationInstance>* instances, InferenceTiming* timing) {
     if (!instances || !initialized_ || !rgbaDevice || sourceWidth <= 0 || sourceHeight <= 0 ||
         rgbaWidth <= 0 || rgbaHeight <= 0 || confidenceThreshold < 0.0F || iouThreshold < 0.0F) return false;
+    if (timing) *timing = {};
+    const auto totalStart = std::chrono::steady_clock::now();
     instances->clear();
     const float scale = std::min(static_cast<float>(inputSize_) / sourceWidth,
                                  static_cast<float>(inputSize_) / sourceHeight);
     const LetterboxInfo letterbox{scale, scale,
                                   (inputSize_ - static_cast<int>(std::round(sourceWidth * scale))) / 2,
                                   (inputSize_ - static_cast<int>(std::round(sourceHeight * scale))) / 2};
+    if (cudaEventRecord(gpuStartEvent_, stream_) != cudaSuccess) return false;
     if (!preprocessRgbaOnGpu(rgbaDevice, sourcePitch, rgbaWidth, rgbaHeight,
                              static_cast<float*>(input_.device), inputSize_, stream_) ||
+        cudaEventRecord(gpuPreprocessEvent_, stream_) != cudaSuccess ||
         !context_->setInputTensorAddress(input_.name.c_str(), input_.device)) return false;
     for (const auto& output : outputs_) {
         if (!context_->setOutputTensorAddress(output.name.c_str(), output.device)) return false;
     }
     if (!context_->enqueueV3(stream_)) return false;
-    std::vector<std::vector<float>> hostOutputs(outputs_.size());
+    if (cudaEventRecord(gpuInferenceEvent_, stream_) != cudaSuccess) return false;
     for (size_t index = 0; index < outputs_.size(); ++index) {
-        hostOutputs[index].resize(outputs_[index].bytes / sizeof(float));
-        if (cudaMemcpyAsync(hostOutputs[index].data(), outputs_[index].device, outputs_[index].bytes,
+        if (cudaMemcpyAsync(hostOutputs_[index].data(), outputs_[index].device, outputs_[index].bytes,
                             cudaMemcpyDeviceToHost, stream_) != cudaSuccess) return false;
     }
-    if (cudaStreamSynchronize(stream_) != cudaSuccess) return false;
+    if (cudaEventRecord(gpuOutputCopyEvent_, stream_) != cudaSuccess ||
+        cudaEventSynchronize(gpuOutputCopyEvent_) != cudaSuccess) return false;
+    float gpuPreprocessMs = 0.0F;
+    float tensorRtMs = 0.0F;
+    float outputCopyMs = 0.0F;
+    if (cudaEventElapsedTime(&gpuPreprocessMs, gpuStartEvent_, gpuPreprocessEvent_) != cudaSuccess ||
+        cudaEventElapsedTime(&tensorRtMs, gpuPreprocessEvent_, gpuInferenceEvent_) != cudaSuccess ||
+        cudaEventElapsedTime(&outputCopyMs, gpuInferenceEvent_, gpuOutputCopyEvent_) != cudaSuccess) return false;
+    if (timing) {
+        timing->gpuPreprocessMs = gpuPreprocessMs;
+        timing->tensorRtMs = tensorRtMs;
+        timing->outputCopyMs = outputCopyMs;
+    }
 
     int headIndex = -1;
     int protoIndex = -1;
@@ -228,7 +271,8 @@ bool YoloV8Segmentation::infer(const void* rgbaDevice, size_t sourcePitch, int s
 
     struct Candidate { SegmentationInstance instance; std::vector<float> coefficients; };
     std::vector<Candidate> candidates;
-    const auto& head = hostOutputs[headIndex];
+    const auto candidateDecodeStart = std::chrono::steady_clock::now();
+    const auto& head = hostOutputs_[headIndex];
     for (int prediction = 0; prediction < predictions; ++prediction) {
         int classId = 0;
         float confidence = outputAt(head, predictions, prediction, 4);
@@ -255,21 +299,39 @@ bool YoloV8Segmentation::infer(const void* rgbaDevice, size_t sourcePitch, int s
         }
         candidates.push_back(std::move(candidate));
     }
-    if (candidates.empty()) return true;
+    if (timing) {
+        timing->candidateDecodeMs = static_cast<float>(std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - candidateDecodeStart).count());
+    }
+    if (candidates.empty()) {
+        if (timing) {
+            timing->totalMs = static_cast<float>(std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - totalStart).count());
+        }
+        return true;
+    }
 
+    const auto nmsStart = std::chrono::steady_clock::now();
     std::vector<cv::Rect> boxes;
     std::vector<float> confidences;
+    std::vector<int> classIds;
     boxes.reserve(candidates.size());
     confidences.reserve(candidates.size());
-    for (const auto& candidate : candidates) { boxes.push_back(candidate.instance.box); confidences.push_back(candidate.instance.confidence); }
+    classIds.reserve(candidates.size());
+    for (const auto& candidate : candidates) {
+        boxes.push_back(candidate.instance.box);
+        confidences.push_back(candidate.instance.confidence);
+        classIds.push_back(candidate.instance.classId);
+    }
     std::vector<int> keep;
-    cv::dnn::NMSBoxesBatched(boxes, confidences, [&] {
-        std::vector<int> classIds; classIds.reserve(candidates.size());
-        for (const auto& candidate : candidates) classIds.push_back(candidate.instance.classId);
-        return classIds;
-    }(), confidenceThreshold, iouThreshold, keep);
+    cv::dnn::NMSBoxesBatched(boxes, confidences, classIds, confidenceThreshold, iouThreshold, keep);
+    if (timing) {
+        timing->nmsMs = static_cast<float>(std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - nmsStart).count());
+    }
 
-    const auto& proto = hostOutputs[protoIndex];
+    const auto maskDecodeStart = std::chrono::steady_clock::now();
+    const auto& proto = hostOutputs_[protoIndex];
     cv::Mat protoMatrix(maskDimensions, protoDims.d[2] * protoDims.d[3], CV_32F,
                         const_cast<float*>(proto.data()));
     for (const int index : keep) {
@@ -290,6 +352,12 @@ bool YoloV8Segmentation::infer(const void* rgbaDevice, size_t sourcePitch, int s
     std::sort(instances->begin(), instances->end(), [](const auto& left, const auto& right) {
         return left.confidence > right.confidence;
     });
+    if (timing) {
+        timing->maskDecodeMs = static_cast<float>(std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - maskDecodeStart).count());
+        timing->totalMs = static_cast<float>(std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - totalStart).count());
+    }
     return true;
 }
 

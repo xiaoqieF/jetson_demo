@@ -10,7 +10,6 @@
 #include <cstdint>
 #include <cstddef>
 #include <atomic>
-#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <memory>
@@ -29,12 +28,6 @@ public:
     ~InferenceNode() override;
 
 private:
-    struct PreprocessTiming {
-        float rgbaClearMs = 0.0F;
-        float yuvTransformMs = 0.0F;
-        float eglCudaInteropMs = 0.0F;
-    };
-
     struct StagingSlot {
         enum class State {
             kFree,
@@ -44,7 +37,6 @@ private:
         };
 
         int rgbaDmabuf = -1;
-        bool rgbaInitialized = false;
         uint32_t width = 0;
         uint32_t height = 0;
         std::shared_ptr<argus_transport::ArgusFrameOwner> sourceFrame;
@@ -52,17 +44,14 @@ private:
         CUgraphicsResource mappedRgbaResource = nullptr;
         std_msgs::msg::Header header;
         uint64_t frameNumber = 0;
-        float stagingMs = 0.0F;
-        std::chrono::steady_clock::time_point enqueuedAt;
         State state = State::kFree;
     };
 
     void stageFrame(argus_transport::ArgusFramePacket::ConstSharedPtr packet);
     void inferenceLoop();
     void inferFrame(size_t slotIndex);
-    bool copyYuvToRgbaGpu(StagingSlot* slot, void** rgbaDevice, size_t* sourcePitch,
-                          PreprocessTiming* timing);
-    bool ensureSlotSurfaces(StagingSlot* slot, uint32_t width, uint32_t height);
+    bool copyYuvToRgbaGpu(StagingSlot* slot, void** rgbaDevice, size_t* sourcePitch);
+    bool initializeSlotSurface(StagingSlot* slot);
     void releaseSlotCudaInterop(StagingSlot* slot);
     void releaseSlot(StagingSlot* slot);
     bool reserveSlot(size_t* slotIndex);

@@ -8,7 +8,6 @@
 #include <EGL/egl.h>
 #include <cudaEGL.h>
 
-#include <chrono>
 #include <algorithm>
 #include <cmath>
 #include <rclcpp/logging.hpp>
@@ -41,6 +40,12 @@ InferenceNode::InferenceNode(const rclcpp::NodeOptions& options)
         throw std::runtime_error("无法加载 YOLOv8 TensorRT engine: " + enginePath);
     }
     frameSlots_.resize(static_cast<size_t>(stagingBufferCount));
+    for (auto& slot : frameSlots_) {
+        if (!initializeSlotSurface(&slot)) {
+            for (auto& initializedSlot : frameSlots_) releaseSlot(&initializedSlot);
+            throw std::runtime_error("创建 RGBA 推理 dmabuf 失败");
+        }
+    }
     publisher_ = create_publisher<argus_interfaces::msg::ArgusInferenceResult>(
         outputTopic, rclcpp::QoS(rclcpp::KeepLast(8)).reliable());
     inferenceThread_ = std::thread(&InferenceNode::inferenceLoop, this);
@@ -61,12 +66,8 @@ InferenceNode::~InferenceNode() {
     for (auto& slot : frameSlots_) releaseSlot(&slot);
 }
 
-bool InferenceNode::ensureSlotSurfaces(StagingSlot* slot, uint32_t width, uint32_t height) {
+bool InferenceNode::initializeSlotSurface(StagingSlot* slot) {
     if (!slot) return false;
-    if (width == slot->width && height == slot->height && slot->rgbaDmabuf >= 0) return true;
-    releaseSlotCudaInterop(slot);
-    if (slot->rgbaDmabuf >= 0) NvBufSurf::NvDestroy(slot->rgbaDmabuf);
-    slot->rgbaDmabuf = -1;
     NvBufSurf::NvCommonAllocateParams params{};
     params.width = static_cast<uint32_t>(inputSize_);
     params.height = static_cast<uint32_t>(inputSize_);
@@ -79,53 +80,52 @@ bool InferenceNode::ensureSlotSurfaces(StagingSlot* slot, uint32_t width, uint32
         slot->rgbaDmabuf = -1;
         return false;
     }
-    slot->rgbaInitialized = false;
-    slot->width = width;
-    slot->height = height;
+    NvBufSurface* surface = nullptr;
+    if (NvBufSurfaceFromFd(slot->rgbaDmabuf, reinterpret_cast<void**>(&surface)) != 0 || !surface) {
+        RCLCPP_ERROR(get_logger(), "从 RGBA dmabuf 获取 NvBufSurface 失败");
+        NvBufSurf::NvDestroy(slot->rgbaDmabuf);
+        slot->rgbaDmabuf = -1;
+        return false;
+    }
+    if (NvBufSurfaceMap(surface, 0, 0, NVBUF_MAP_WRITE) != 0) {
+        RCLCPP_ERROR(get_logger(), "映射 RGBA dmabuf 失败");
+        NvBufSurf::NvDestroy(slot->rgbaDmabuf);
+        slot->rgbaDmabuf = -1;
+        return false;
+    }
+    auto* mapped = static_cast<uint32_t*>(surface->surfaceList[0].mappedAddr.addr[0]);
+    if (!mapped) {
+        NvBufSurfaceUnMap(surface, 0, 0);
+        RCLCPP_ERROR(get_logger(), "获取 RGBA dmabuf CPU 地址失败");
+        NvBufSurf::NvDestroy(slot->rgbaDmabuf);
+        slot->rgbaDmabuf = -1;
+        return false;
+    }
+    constexpr uint32_t kLetterboxRgba = 0xFF727272U;
+    const size_t pixelsPerRow = surface->surfaceList[0].pitch / sizeof(uint32_t);
+    for (uint32_t row = 0; row < static_cast<uint32_t>(inputSize_); ++row) {
+        std::fill_n(mapped + static_cast<size_t>(row) * pixelsPerRow,
+                    static_cast<size_t>(inputSize_), kLetterboxRgba);
+    }
+    const bool synchronized = NvBufSurfaceSyncForDevice(surface, 0, 0) == 0;
+    NvBufSurfaceUnMap(surface, 0, 0);
+    if (!synchronized) {
+        RCLCPP_ERROR(get_logger(), "同步 RGBA dmabuf 到设备失败");
+        NvBufSurf::NvDestroy(slot->rgbaDmabuf);
+        slot->rgbaDmabuf = -1;
+        return false;
+    }
     return true;
 }
 
-bool InferenceNode::copyYuvToRgbaGpu(StagingSlot* slot, void** rgbaDevice, size_t* sourcePitch,
-                                      PreprocessTiming* timing) {
+bool InferenceNode::copyYuvToRgbaGpu(StagingSlot* slot, void** rgbaDevice, size_t* sourcePitch) {
     if (!slot || !rgbaDevice || !sourcePitch || !slot->sourceFrame || slot->rgbaDmabuf < 0) return false;
-    if (timing) *timing = {};
 
     NvBufSurface* surface = nullptr;
     if (NvBufSurfaceFromFd(slot->rgbaDmabuf, reinterpret_cast<void**>(&surface)) != 0 || !surface) {
         RCLCPP_ERROR(get_logger(), "从 RGBA dmabuf 获取 NvBufSurface 失败");
         return false;
     }
-    if (!slot->rgbaInitialized) {
-        const auto rgbaClearStart = std::chrono::steady_clock::now();
-        if (NvBufSurfaceMap(surface, 0, 0, NVBUF_MAP_WRITE) != 0) {
-            RCLCPP_ERROR(get_logger(), "映射 RGBA dmabuf 失败");
-            return false;
-        }
-        auto* mapped = static_cast<uint32_t*>(surface->surfaceList[0].mappedAddr.addr[0]);
-        if (!mapped) {
-            NvBufSurfaceUnMap(surface, 0, 0);
-            RCLCPP_ERROR(get_logger(), "获取 RGBA dmabuf CPU 地址失败");
-            return false;
-        }
-        constexpr uint32_t kLetterboxRgba = 0xFF727272U;
-        const size_t pixelsPerRow = surface->surfaceList[0].pitch / sizeof(uint32_t);
-        for (uint32_t row = 0; row < static_cast<uint32_t>(inputSize_); ++row) {
-            std::fill_n(mapped + static_cast<size_t>(row) * pixelsPerRow,
-                        static_cast<size_t>(inputSize_), kLetterboxRgba);
-        }
-        if (NvBufSurfaceSyncForDevice(surface, 0, 0) != 0) {
-            NvBufSurfaceUnMap(surface, 0, 0);
-            RCLCPP_ERROR(get_logger(), "同步 RGBA dmabuf 到设备失败");
-            return false;
-        }
-        NvBufSurfaceUnMap(surface, 0, 0);
-        slot->rgbaInitialized = true;
-        if (timing) {
-            timing->rgbaClearMs = static_cast<float>(std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - rgbaClearStart).count());
-        }
-    }
-
     NvBufSurf::NvCommonTransformParams transform{};
     transform.src_width = slot->width;
     transform.src_height = slot->height;
@@ -139,7 +139,6 @@ bool InferenceNode::copyYuvToRgbaGpu(StagingSlot* slot, void** rgbaDevice, size_
         NVBUFSURF_TRANSFORM_FILTER | NVBUFSURF_TRANSFORM_CROP_DST);
     transform.flip = NvBufSurfTransform_None;
     transform.filter = NvBufSurfTransformInter_Bilinear;
-    const auto transformStart = std::chrono::steady_clock::now();
     const int sourceDmabuf = slot->sourceFrame->dmabuf();
     NvBufSurface* sourceSurface = nullptr;
     if (NvBufSurfaceFromFd(sourceDmabuf, reinterpret_cast<void**>(&sourceSurface)) != 0 || !sourceSurface) {
@@ -160,12 +159,7 @@ bool InferenceNode::copyYuvToRgbaGpu(StagingSlot* slot, void** rgbaDevice, size_
         return false;
     }
     slot->sourceFrame.reset();
-    if (timing) {
-        timing->yuvTransformMs = static_cast<float>(std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - transformStart).count());
-    }
 
-    const auto eglCudaInteropStart = std::chrono::steady_clock::now();
     if (NvBufSurfaceMapEglImage(surface, 0) != 0) {
         RCLCPP_ERROR(get_logger(), "创建 RGBA EGL image 失败");
         return false;
@@ -199,10 +193,6 @@ bool InferenceNode::copyYuvToRgbaGpu(StagingSlot* slot, void** rgbaDevice, size_
     slot->mappedRgbaSurface = surface;
     *rgbaDevice = eglFrame.frame.pPitch[0];
     *sourcePitch = eglFrame.pitch;
-    if (timing) {
-        timing->eglCudaInteropMs = static_cast<float>(std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - eglCudaInteropStart).count());
-    }
     return true;
 }
 
@@ -223,7 +213,6 @@ void InferenceNode::releaseSlot(StagingSlot* slot) {
     releaseSlotCudaInterop(slot);
     if (slot->rgbaDmabuf >= 0) NvBufSurf::NvDestroy(slot->rgbaDmabuf);
     slot->rgbaDmabuf = -1;
-    slot->rgbaInitialized = false;
     slot->width = 0;
     slot->height = 0;
     slot->sourceFrame.reset();
@@ -273,15 +262,9 @@ void InferenceNode::stageFrame(argus_transport::ArgusFramePacket::ConstSharedPtr
     auto& slot = frameSlots_[slotIndex];
     slot.header = packet->header;
     slot.frameNumber = packet->frame_number;
-    const auto stagingStart = std::chrono::steady_clock::now();
-    if (!ensureSlotSurfaces(&slot, packet->width, packet->height)) {
-        releaseSlotForReuse(slotIndex);
-        return;
-    }
+    slot.width = packet->width;
+    slot.height = packet->height;
     slot.sourceFrame = packet->frame;
-    slot.stagingMs = static_cast<float>(std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - stagingStart).count());
-    slot.enqueuedAt = std::chrono::steady_clock::now();
     packet.reset();
 
     {
@@ -313,34 +296,26 @@ void InferenceNode::inferenceLoop() {
 }
 
 void InferenceNode::inferFrame(size_t slotIndex) {
-    const auto processingStart = std::chrono::steady_clock::now();
     void* rgbaDevice = nullptr;
     size_t sourcePitch = 0;
     auto& slot = frameSlots_[slotIndex];
-    PreprocessTiming preprocessTiming;
-    if (!copyYuvToRgbaGpu(&slot, &rgbaDevice, &sourcePitch, &preprocessTiming)) return;
+    if (!copyYuvToRgbaGpu(&slot, &rgbaDevice, &sourcePitch)) return;
     std::vector<SegmentationInstance> instances;
-    const auto modelStart = std::chrono::steady_clock::now();
+    InferenceTiming modelTiming;
     const bool inferred = model_->infer(rgbaDevice, sourcePitch, slot.width, slot.height, inputSize_, inputSize_,
-                                        confidenceThreshold_, iouThreshold_, &instances);
-    const float modelMs = static_cast<float>(std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - modelStart).count());
-    const auto interopReleaseStart = std::chrono::steady_clock::now();
+                                        confidenceThreshold_, iouThreshold_, &instances, &modelTiming);
     releaseSlotCudaInterop(&slot);
-    const float interopReleaseMs = static_cast<float>(std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - interopReleaseStart).count());
     if (!inferred) {
         RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000, "YOLOv8-seg TensorRT 推理失败");
         return;
     }
 
-    const auto publishStart = std::chrono::steady_clock::now();
     argus_interfaces::msg::ArgusInferenceResult result;
     result.header = slot.header;
     result.frame_number = slot.frameNumber;
     result.image_width = slot.width;
     result.image_height = slot.height;
-    result.inference_ms = modelMs;
+    result.inference_ms = modelTiming.totalMs;
     result.instances.reserve(instances.size());
     for (const auto& instance : instances) {
         argus_interfaces::msg::ArgusInstanceSegmentation message;
@@ -362,22 +337,15 @@ void InferenceNode::inferFrame(size_t slotIndex) {
         result.instances.push_back(std::move(message));
     }
     publisher_->publish(std::move(result));
-    const float publishMs = static_cast<float>(std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - publishStart).count());
     ++processedFrames_;
-    const float workerMs = static_cast<float>(std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - processingStart).count());
-    const float queueMs = static_cast<float>(std::chrono::duration<double, std::milli>(
-        processingStart - slot.enqueuedAt).count());
     if (processedFrames_ % timingLogEveryNFrames_ == 0) {
-        const float endToEndMs = slot.stagingMs + queueMs + workerMs;
         RCLCPP_INFO(
             get_logger(),
-            "性能 #%lu（源帧 #%lu，%ux%u，%zu 个实例）：Argus→YUV %.1f ms，排队 %.1f ms，RGBA 清屏 %.1f ms，YUV→RGBA %.1f ms，EGL/CUDA 映射 %.1f ms，模型端到端 %.1f ms，EGL/CUDA 释放 %.1f ms，结果组包+发布 %.1f ms，worker %.1f ms，端到端 %.1f ms；丢弃 %lu，替换旧帧 %lu",
+            "模型性能 #%lu（源帧 #%lu，%ux%u，%zu 个实例）：GPU 预处理 %.2f ms，TensorRT %.2f ms，输出回传 %.2f ms，候选框解码 %.2f ms，NMS %.2f ms，掩码解码 %.2f ms，模型端到端 %.2f ms；丢弃 %lu，替换旧帧 %lu",
             static_cast<unsigned long>(processedFrames_), static_cast<unsigned long>(slot.frameNumber),
-            slot.width, slot.height, instances.size(), slot.stagingMs, queueMs, preprocessTiming.rgbaClearMs,
-            preprocessTiming.yuvTransformMs, preprocessTiming.eglCudaInteropMs, modelMs, interopReleaseMs,
-            publishMs, workerMs, endToEndMs, static_cast<unsigned long>(droppedFrames_.load()),
+            slot.width, slot.height, instances.size(), modelTiming.gpuPreprocessMs, modelTiming.tensorRtMs,
+            modelTiming.outputCopyMs, modelTiming.candidateDecodeMs, modelTiming.nmsMs,
+            modelTiming.maskDecodeMs, modelTiming.totalMs, static_cast<unsigned long>(droppedFrames_.load()),
             static_cast<unsigned long>(supersededFrames_.load()));
     }
 }
