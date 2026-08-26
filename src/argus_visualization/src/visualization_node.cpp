@@ -22,7 +22,7 @@ VisualizationNode::VisualizationNode(const rclcpp::NodeOptions& options)
     subscription_ = create_subscription<argus_transport::ArgusFramePacket>(
         inputTopic, rclcpp::QoS(rclcpp::KeepLast(8)).reliable(),
         [this](argus_transport::ArgusFramePacket::ConstSharedPtr message) {
-            // publishJpeg(*message);
+            publishJpeg(*message);
         });
 }
 

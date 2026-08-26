@@ -18,6 +18,7 @@ struct Controls {
     Argus::EdgeEnhanceMode edgeMode = Argus::EDGE_ENHANCE_MODE_FAST;
     bool manualWb = false;
     Argus::BayerTuple<float> wbGains = Argus::BayerTuple<float>(1.0f);
+    double frameRate = 0.0;
 };
 
 bool check(bool condition, const std::string& message);

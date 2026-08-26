@@ -8,6 +8,7 @@
 
 #include <EGL/egl.h>
 
+#include <cmath>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -43,6 +44,8 @@ ArgusCameraNode::ArgusCameraNode(const rclcpp::NodeOptions& options)
     sensorModeIndex_ = declare_parameter<int>("sensor_mode_index", 0);
     fifoLength_ = declare_parameter<int>("fifo_length", 8);
     captureBufferCount_ = declare_parameter<int>("capture_buffer_count", fifoLength_);
+    frameRate_ = declare_parameter<double>("frame_rate", 0.0);
+    controls_.frameRate = frameRate_;
     controls_.saturation = static_cast<float>(declare_parameter<double>("saturation", 1.0));
     controls_.exposureCompensation = static_cast<float>(
         declare_parameter<double>("exposure_compensation", 0.0));
@@ -60,6 +63,7 @@ ArgusCameraNode::ArgusCameraNode(const rclcpp::NodeOptions& options)
 
     if (requestedFrames_ < 0 || cameraIndex_ < 0 || sensorModeIndex_ < 0 || fifoLength_ <= 0 ||
         captureBufferCount_ < 2 ||
+        !std::isfinite(frameRate_) || frameRate_ < 0.0 || frameRate_ > 1.0e9 ||
         controls_.saturation < 0.0f || controls_.saturation > 2.0f ||
         controls_.ispDigitalGain <= 0.0f || controls_.denoiseStrength < 0.0f ||
         controls_.denoiseStrength > 1.0f || controls_.edgeStrength < 0.0f ||
@@ -113,8 +117,15 @@ bool ArgusCameraNode::start() {
     auto* sensorModeInterface = Argus::interface_cast<Argus::ISensorMode>(sensorMode_);
     if (!continuous_capture::check(sensorModeInterface != nullptr, "无法获取 sensor mode 接口")) return false;
     resolution_ = sensorModeInterface->getResolution();
-    RCLCPP_INFO(get_logger(), "已选择 sensor_mode_index=%d，YUV 输出分辨率=%ux%u",
-                sensorModeIndex_, resolution_.width(), resolution_.height());
+    const auto frameDurationRange = sensorModeInterface->getFrameDurationRange();
+    RCLCPP_INFO(get_logger(),
+                "已选择 sensor_mode_index=%d，YUV 输出分辨率=%ux%u，支持帧周期=%llu..%llu ns",
+                sensorModeIndex_, resolution_.width(), resolution_.height(),
+                static_cast<unsigned long long>(frameDurationRange.min()),
+                static_cast<unsigned long long>(frameDurationRange.max()));
+    if (frameRate_ > 0.0) {
+        RCLCPP_INFO(get_logger(), "请求采集帧率=%.3f FPS", frameRate_);
+    }
 
     Argus::Status status = Argus::STATUS_OK;
     session_.reset(iProvider_->createCaptureSession(device, &status));

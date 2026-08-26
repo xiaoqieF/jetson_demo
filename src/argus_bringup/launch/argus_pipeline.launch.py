@@ -15,6 +15,7 @@ def generate_launch_description():
         'fifo_length': ParameterValue(LaunchConfiguration('fifo_length'), value_type=int),
         'capture_buffer_count': ParameterValue(
             LaunchConfiguration('capture_buffer_count'), value_type=int),
+        'frame_rate': ParameterValue(LaunchConfiguration('frame_rate'), value_type=float),
         'frame_id': ParameterValue(LaunchConfiguration('frame_id'), value_type=str),
     }
     container = ComposableNodeContainer(
@@ -51,6 +52,7 @@ def generate_launch_description():
         DeclareLaunchArgument('frame_count', default_value='0'),
         DeclareLaunchArgument('fifo_length', default_value='8'),
         DeclareLaunchArgument('capture_buffer_count', default_value='8'),
+        DeclareLaunchArgument('frame_rate', default_value='0.0'),
         DeclareLaunchArgument('frame_id', default_value='camera'),
         container,
     ])

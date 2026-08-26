@@ -168,14 +168,16 @@ ros2 launch argus_bringup argus_pipeline.launch.py
 ```bash
 ros2 launch argus_bringup argus_pipeline.launch.py \
   camera_index:=0 sensor_mode_index:=0 frame_count:=100 \
-  capture_buffer_count:=8 frame_id:=camera
+  capture_buffer_count:=8 frame_rate:=30 frame_id:=camera
 ```
 
 `camera_index` 和 `sensor_mode_index` 分别选择 LibArgus 枚举到的摄像头与 sensor mode；
-`frame_count=0` 表示持续采集。采集节点还提供以下启动参数，适合写入 ROS 参数 YAML：
+`frame_count=0` 表示持续采集；`frame_rate=0` 表示使用 sensor mode 默认帧率，否则按请求的
+FPS 设置采集帧周期（超出传感器支持范围时由 Argus 取最接近值）。采集节点还提供以下启动参数，
+适合写入 ROS 参数 YAML：
 
 ```text
-topic, frame_id, frame_count, camera_index, sensor_mode_index, capture_buffer_count
+topic, frame_id, frame_count, camera_index, sensor_mode_index, capture_buffer_count, frame_rate
 saturation, exposure_compensation, isp_digital_gain
 denoise_mode (off|fast|hq), denoise_strength
 edge_enhance_mode (off|fast|hq), edge_enhance_strength

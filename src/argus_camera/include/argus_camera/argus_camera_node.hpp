@@ -44,6 +44,7 @@ private:
     int sensorModeIndex_ = 0;
     int fifoLength_ = 8;
     int captureBufferCount_ = 8;
+    double frameRate_ = 0.0;
     std::string frameId_;
     std::atomic<bool> quit_{false};
     std::atomic<bool> started_{false};
