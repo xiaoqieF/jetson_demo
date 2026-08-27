@@ -16,7 +16,7 @@ MIPI CSI-2 sensor
         │
         └── ISP（去马赛克、白平衡、降噪、色彩校正等）
                 └── NV12 block-linear NVMM buffer pool
-                        ├── YOLOv8-seg TensorRT 推理 → /camera/inference/segmentation
+                        ├── YOLOv8-seg TensorRT 推理 → /camera/inference/overlay/compressed
                         └── JPEG 编码 → /camera/image/compressed
 ```
 
@@ -116,26 +116,26 @@ native dma-buf lease 是进程内句柄，不能直接拿到另一个独立进�
 engine 构建逻辑。它直接将采集 dma-buf 作为 VIC 的 YUV 输入，转为可复用的 RGBA dmabuf；
 随后通过 `NvBufSurfaceMapEglImage` 和 CUDA EGL interop 取得 RGBA
 device pointer，由 CUDA kernel 完成双线性 letterbox、RGB 排列、CHW 与 `[0, 1]` 归一化，
-并直接写入 TensorRT input buffer。图像不映射到 CPU，也没有 host-to-device 输入复制。
+并直接写入 TensorRT input buffer。推理输入没有 host-to-device 复制；推理完成后仅将 640×640
+RGBA surface 映射到 CPU，用于生成可视化 overlay JPEG。
 检测头在节点内回传 CPU 完成类别 NMS 与坐标反变换；mask prototype 始终保留在 GPU，CUDA kernel
-使用 NMS 保留目标的系数直接解码、缩放并二值化各自的 ROI 掩码。只有检测头和最终发布的
-ROI 分割结果会回到 CPU。
+使用 NMS 保留目标的系数直接解码、缩放并二值化各自的 ROI 掩码；检测头和用于生成 overlay 的
+结果会回到 CPU。
 可视化节点直接使用同一采集 dma-buf 进行 JPEG 编码。
 
-分割结果发布到 `/camera/inference/segmentation`，类型为
-`argus_interfaces/msg/ArgusInferenceResult`。结果沿用采集帧的 `header` 和 `frame_number`，
-并包含图像尺寸、模型处理端到端时延（`inference_ms`）和每个实例的类别、置信度、原图坐标框。
-节点按 `timing_log_every_n_frames` 输出 GPU 预处理、TensorRT 执行、输出回传、候选框解码、NMS
-和掩码解码的分段耗时。每个实例的
-`mask` 是其 bounding-box ROI 的行优先 `mono8` 二值掩码；用 `mask_x`、`mask_y`、
-`mask_width` 和 `mask_height` 即可投回原图。
+可视化发布默认关闭；设置 `enable_overlay:=true` 后，推理结果以可视化专用的
+`sensor_msgs/msg/CompressedImage` 发布到 `/camera/inference/overlay/compressed`，图像为 JPEG
+格式：在推理用的 640×640 RGBA surface 上叠加实例掩码、边界框、类别和置信度。发布器使用
+`best_effort`、`KeepLast(1)` QoS，网络拥塞时丢弃旧帧而不积压延迟；可通过 `overlay_quality`
+（默认 90）调整 JPEG 质量。该 topic 可直接在 RViz2 中使用 Image display 订阅，适合跨局域网
+实时预览。
 
 默认 engine 是 `/home/royfan/yolov8_trt/yolov8s-seg-640.engine`，profile 固定为
 `1x3x640x640`。engine 必须在目标 Jetson 上离线构建；节点启动时只反序列化并加载该文件，
 若文件缺失或与目标平台/TensorRT 版本不兼容，节点会立即报错退出。可通过以下参数调整：
 
 ```text
-input_topic, output_topic
+input_topic, output_topic, enable_overlay, overlay_quality
 engine_path, input_size
 timing_log_every_n_frames
 confidence_threshold, iou_threshold

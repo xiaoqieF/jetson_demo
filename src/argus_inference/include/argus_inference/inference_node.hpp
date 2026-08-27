@@ -1,8 +1,9 @@
 #pragma once
 
 #include <argus_transport/argus_frame_packet.hpp>
-#include <argus_interfaces/msg/argus_inference_result.hpp>
+#include <argus_inference/yolov8_segmentation.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/compressed_image.hpp>
 
 #include <cuda_runtime_api.h>
 #include <cuda.h>
@@ -16,10 +17,9 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace argus_inference {
-
-class YoloV8Segmentation;
 
 class InferenceNode final : public rclcpp::Node {
 public:
@@ -51,6 +51,9 @@ private:
     void stageFrame(argus_transport::ArgusFramePacket::ConstSharedPtr packet);
     void inferenceLoop();
     void inferFrame(PendingFrame frame);
+    // 发布示例分割可视化，十分耗时
+    bool publishOverlay(const StagingSlot& slot,
+                       const std::vector<SegmentationInstance>& instances);
     bool copyYuvToRgbaGpu(StagingSlot* slot, void** rgbaDevice, size_t* sourcePitch);
     bool initializeSlotSurface(StagingSlot* slot);
     bool initializeSlotCudaInterop(StagingSlot* slot);
@@ -58,13 +61,15 @@ private:
     void releaseSlot(StagingSlot* slot);
 
     rclcpp::Subscription<argus_transport::ArgusFramePacket>::SharedPtr subscription_;
-    rclcpp::Publisher<argus_interfaces::msg::ArgusInferenceResult>::SharedPtr publisher_;
+    rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr publisher_;
     std::unique_ptr<YoloV8Segmentation> model_;
     std::string inputTopic_;
     int inputSize_ = 640;
     uint64_t timingLogEveryNFrames_ = 30;
     float confidenceThreshold_ = 0.25F;
     float iouThreshold_ = 0.45F;
+    int overlayQuality_ = 90;
+    bool enableOverlay_ = false;
     StagingSlot inferenceSlot_;
     std::optional<PendingFrame> pendingFrame_;
     std::mutex jobsMutex_;

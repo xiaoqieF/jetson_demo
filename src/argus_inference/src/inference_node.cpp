@@ -10,6 +10,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
 #include <rclcpp/logging.hpp>
 #include <stdexcept>
 #include <utility>
@@ -20,16 +22,19 @@ namespace argus_inference {
 InferenceNode::InferenceNode(const rclcpp::NodeOptions& options)
     : Node("yuv_inference_node", options) {
     inputTopic_ = declare_parameter<std::string>("input_topic", "/camera/image/yuv");
-    const auto outputTopic = declare_parameter<std::string>("output_topic", "/camera/inference/segmentation");
+    const auto outputTopic = declare_parameter<std::string>(
+        "output_topic", "/camera/inference/overlay/compressed");
     const auto enginePath = declare_parameter<std::string>("engine_path", "/home/royfan/yolov8_trt/yolov8s-seg-640.engine");
     inputSize_ = declare_parameter<int>("input_size", 640);
     const auto requireFp16Engine = declare_parameter<bool>("require_fp16_engine", true);
     const auto timingLogEveryNFrames = declare_parameter<int>("timing_log_every_n_frames", 30);
     confidenceThreshold_ = static_cast<float>(declare_parameter<double>("confidence_threshold", 0.25));
     iouThreshold_ = static_cast<float>(declare_parameter<double>("iou_threshold", 0.45));
+    overlayQuality_ = declare_parameter<int>("overlay_quality", 90);
+    enableOverlay_ = declare_parameter<bool>("enable_overlay", false);
     if (inputSize_ <= 0 || timingLogEveryNFrames <= 0 ||
         confidenceThreshold_ < 0.0F || confidenceThreshold_ > 1.0F ||
-        iouThreshold_ < 0.0F || iouThreshold_ > 1.0F) {
+        iouThreshold_ < 0.0F || iouThreshold_ > 1.0F || overlayQuality_ < 1 || overlayQuality_ > 100) {
         throw std::invalid_argument("TensorRT inference parameter is invalid");
     }
     timingLogEveryNFrames_ = static_cast<uint64_t>(timingLogEveryNFrames);
@@ -42,8 +47,10 @@ InferenceNode::InferenceNode(const rclcpp::NodeOptions& options)
         releaseSlot(&inferenceSlot_);
         throw std::runtime_error("创建 RGBA 推理 dmabuf 失败");
     }
-    publisher_ = create_publisher<argus_interfaces::msg::ArgusInferenceResult>(
-        outputTopic, rclcpp::QoS(rclcpp::KeepLast(8)).reliable());
+    if (enableOverlay_) {
+        publisher_ = create_publisher<sensor_msgs::msg::CompressedImage>(
+            outputTopic, rclcpp::QoS(rclcpp::KeepLast(1)).best_effort());
+    }
     inferenceThread_ = std::thread(&InferenceNode::inferenceLoop, this);
     subscription_ = create_subscription<argus_transport::ArgusFramePacket>(
         inputTopic_, rclcpp::QoS(rclcpp::KeepLast(1)).best_effort(),
@@ -266,6 +273,105 @@ void InferenceNode::inferenceLoop() {
     }
 }
 
+// 发布示例分割可视化，十分耗时
+bool InferenceNode::publishOverlay(
+    const StagingSlot& slot, const std::vector<SegmentationInstance>& instances) {
+    NvBufSurface* surface = nullptr;
+    if (slot.rgbaDmabuf < 0 || slot.width == 0 || slot.height == 0 || NvBufSurfaceFromFd(
+            slot.rgbaDmabuf, reinterpret_cast<void**>(&surface)) != 0 || !surface) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                             "无法获取推理 RGBA surface，跳过 overlay 发布");
+        return false;
+    }
+    if (NvBufSurfaceMap(surface, 0, 0, NVBUF_MAP_READ) != 0) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                             "无法将推理 RGBA surface 映射到 CPU，跳过 overlay 发布");
+        return false;
+    }
+    if (NvBufSurfaceSyncForCpu(surface, 0, 0) != 0) {
+        NvBufSurfaceUnMap(surface, 0, 0);
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                             "无法同步推理 RGBA surface 到 CPU，跳过 overlay 发布");
+        return false;
+    }
+
+    const auto& surfaceParams = surface->surfaceList[0];
+    const auto* mapped = static_cast<const uint8_t*>(surfaceParams.mappedAddr.addr[0]);
+    if (!mapped || surfaceParams.width == 0 || surfaceParams.height == 0) {
+        NvBufSurfaceUnMap(surface, 0, 0);
+        return false;
+    }
+    cv::Mat rgba(static_cast<int>(surfaceParams.height), static_cast<int>(surfaceParams.width),
+                 CV_8UC4, const_cast<uint8_t*>(mapped), surfaceParams.pitch);
+    cv::Mat overlay;
+    cv::cvtColor(rgba, overlay, cv::COLOR_RGBA2BGR);
+
+    const float scale = std::min(
+        static_cast<float>(surfaceParams.width) / static_cast<float>(slot.width),
+        static_cast<float>(surfaceParams.height) / static_cast<float>(slot.height));
+    const int offsetX = (static_cast<int>(surfaceParams.width) -
+                         static_cast<int>(std::round(slot.width * scale))) / 2;
+    const int offsetY = (static_cast<int>(surfaceParams.height) -
+                         static_cast<int>(std::round(slot.height * scale))) / 2;
+    for (const auto& instance : instances) {
+        const int x = std::clamp(static_cast<int>(std::round(instance.box.x * scale)) + offsetX,
+                                 0, overlay.cols - 1);
+        const int y = std::clamp(static_cast<int>(std::round(instance.box.y * scale)) + offsetY,
+                                 0, overlay.rows - 1);
+        const int width = std::clamp(static_cast<int>(std::round(instance.box.width * scale)),
+                                     1, overlay.cols - x);
+        const int height = std::clamp(static_cast<int>(std::round(instance.box.height * scale)),
+                                      1, overlay.rows - y);
+        const cv::Scalar color(
+            80.0 + (instance.classId * 67) % 150,
+            80.0 + (instance.classId * 41) % 150,
+            80.0 + (instance.classId * 97) % 150);
+        cv::Mat resizedMask;
+        if (!instance.mask.empty()) {
+            cv::resize(instance.mask, resizedMask, cv::Size(width, height), 0.0, 0.0,
+                       cv::INTER_NEAREST);
+            cv::Mat region = overlay(cv::Rect(x, y, width, height));
+            for (int row = 0; row < region.rows; ++row) {
+                for (int column = 0; column < region.cols; ++column) {
+                    if (resizedMask.at<uint8_t>(row, column) != 0) {
+                        auto& pixel = region.at<cv::Vec3b>(row, column);
+                        for (int channel = 0; channel < 3; ++channel) {
+                            pixel[channel] = static_cast<uint8_t>(
+                                pixel[channel] * 0.55 + color[channel] * 0.45);
+                        }
+                    }
+                }
+            }
+        }
+        cv::rectangle(overlay, cv::Rect(x, y, width, height), color, 2);
+        const std::string label = instance.className + " " +
+                                  std::to_string(static_cast<int>(instance.confidence * 100.0F)) + "%";
+        int baseline = 0;
+        const cv::Size textSize = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.45, 1, &baseline);
+        const int textTop = std::max(0, y - textSize.height - baseline - 4);
+        cv::rectangle(overlay, cv::Rect(x, textTop, std::min(textSize.width + 8, overlay.cols - x),
+                                       textSize.height + baseline + 4), color, cv::FILLED);
+        cv::putText(overlay, label, cv::Point(x + 4, textTop + textSize.height + 1),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+    }
+
+    std::vector<uint8_t> encoded;
+    const std::vector<int> encodeParams{cv::IMWRITE_JPEG_QUALITY, overlayQuality_};
+    const bool encodedOk = cv::imencode(".jpg", overlay, encoded, encodeParams);
+    NvBufSurfaceUnMap(surface, 0, 0);
+    if (!encodedOk) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                             "overlay JPEG 编码失败");
+        return false;
+    }
+    sensor_msgs::msg::CompressedImage message;
+    message.header = slot.header;
+    message.format = "jpeg";
+    message.data = std::move(encoded);
+    publisher_->publish(std::move(message));
+    return true;
+}
+
 void InferenceNode::inferFrame(PendingFrame frame) {
     void* rgbaDevice = nullptr;
     size_t sourcePitch = 0;
@@ -292,33 +398,9 @@ void InferenceNode::inferFrame(PendingFrame frame) {
         return;
     }
 
-    argus_interfaces::msg::ArgusInferenceResult result;
-    result.header = slot.header;
-    result.frame_number = slot.frameNumber;
-    result.image_width = slot.width;
-    result.image_height = slot.height;
-    result.inference_ms = modelTiming.totalMs;
-    result.instances.reserve(instances.size());
-    for (const auto& instance : instances) {
-        argus_interfaces::msg::ArgusInstanceSegmentation message;
-        message.class_id = instance.classId;
-        message.class_name = instance.className;
-        message.confidence = instance.confidence;
-        message.x_min = static_cast<float>(instance.box.x);
-        message.y_min = static_cast<float>(instance.box.y);
-        message.x_max = static_cast<float>(instance.box.br().x);
-        message.y_max = static_cast<float>(instance.box.br().y);
-        message.mask_x = static_cast<uint32_t>(instance.box.x);
-        message.mask_y = static_cast<uint32_t>(instance.box.y);
-        message.mask_width = static_cast<uint32_t>(instance.mask.cols);
-        message.mask_height = static_cast<uint32_t>(instance.mask.rows);
-        for (int row = 0; row < instance.mask.rows; ++row) {
-            const auto* data = instance.mask.ptr<uint8_t>(row);
-            message.mask.insert(message.mask.end(), data, data + instance.mask.cols);
-        }
-        result.instances.push_back(std::move(message));
+    if (enableOverlay_) {
+        publishOverlay(slot, instances);
     }
-    publisher_->publish(std::move(result));
     ++processedFrames_;
     if (processedFrames_ % timingLogEveryNFrames_ == 0) {
         RCLCPP_INFO(

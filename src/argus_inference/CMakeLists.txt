@@ -15,11 +15,11 @@ set(JETSON_MMAPI_INCLUDE_DIR "${JETSON_MMAPI_ROOT}/include" CACHE PATH "Jetson M
 find_package(ament_cmake REQUIRED)
 find_package(Threads REQUIRED)
 find_package(CUDAToolkit REQUIRED)
-find_package(OpenCV REQUIRED COMPONENTS core imgproc dnn)
-find_package(argus_interfaces REQUIRED)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs dnn)
 find_package(argus_transport REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
+find_package(sensor_msgs REQUIRED)
 find_path(ARGUS_INCLUDE_DIR Argus/Argus.h HINTS "${ARGUS_INCLUDE_DIR}" REQUIRED)
 find_path(JETSON_MMAPI_INCLUDE_DIR NvBufSurface.h HINTS "${JETSON_MMAPI_INCLUDE_DIR}" REQUIRED)
 find_library(NVINFER_LIBRARY nvinfer REQUIRED)
@@ -41,7 +41,7 @@ add_library(${PROJECT_NAME} SHARED
 target_include_directories(${PROJECT_NAME} PRIVATE
   "${ARGUS_INCLUDE_DIR}" "${JETSON_MMAPI_INCLUDE_DIR}" /usr/local/cuda/include)
 target_include_directories(${PROJECT_NAME} PUBLIC include)
-ament_target_dependencies(${PROJECT_NAME} argus_interfaces argus_transport rclcpp rclcpp_components)
+ament_target_dependencies(${PROJECT_NAME} argus_transport rclcpp rclcpp_components sensor_msgs)
 target_link_libraries(${PROJECT_NAME}
   ${OpenCV_LIBS}
   "${NVINFER_LIBRARY}" CUDA::cudart
