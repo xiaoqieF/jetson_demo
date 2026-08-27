@@ -41,6 +41,7 @@ public:
     bool infer(const void* rgbaDevice, size_t sourcePitch, int sourceWidth, int sourceHeight,
                int rgbaWidth, int rgbaHeight, float confidenceThreshold, float iouThreshold,
                std::vector<SegmentationInstance>* instances, InferenceTiming* timing);
+    bool synchronize() const;
 
     int inputSize() const { return inputSize_; }
 

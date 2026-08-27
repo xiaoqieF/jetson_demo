@@ -361,4 +361,8 @@ bool YoloV8Segmentation::infer(const void* rgbaDevice, size_t sourcePitch, int s
     return true;
 }
 
+bool YoloV8Segmentation::synchronize() const {
+    return !stream_ || cudaStreamSynchronize(stream_) == cudaSuccess;
+}
+
 }  // namespace argus_inference

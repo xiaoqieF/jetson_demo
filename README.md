@@ -136,9 +136,12 @@ device pointer，由 CUDA kernel 完成双线性 letterbox、RGB 排列、CHW �
 ```text
 input_topic, output_topic
 engine_path, input_size
-staging_buffer_count, timing_log_every_n_frames
+timing_log_every_n_frames
 confidence_threshold, iou_threshold
 ```
+
+推理节点只保留一帧正在处理的 RGBA surface 和一帧最新待处理的 YUV handle。模型执行期间到达的
+新帧会替换旧的待处理帧，避免积压导致推理结果滞后。
 
 本机离线生成默认 engine 使用的命令如下；`--noTF32` 避开当前 TensorRT 10.16 安装中 FP16
 CASK tactic 的 shader 断言：
