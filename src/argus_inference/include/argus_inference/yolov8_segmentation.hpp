@@ -1,5 +1,7 @@
 #pragma once
 
+#include "argus_inference/cuda_kernels.hpp"
+
 #include <NvInfer.h>
 #include <cuda_runtime.h>
 
@@ -77,6 +79,7 @@ private:
     Tensor input_;
     std::vector<Tensor> outputs_;
     std::vector<std::vector<float>> hostOutputs_;
+    GpuMaskDecoder maskDecoder_;
     int inputSize_ = 640;
     bool initialized_ = false;
 };

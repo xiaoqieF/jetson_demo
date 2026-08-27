@@ -1,9 +1,6 @@
 #include "argus_inference/yolov8_segmentation.hpp"
 
-#include "argus_inference/cuda_preprocess.hpp"
-
 #include <opencv2/dnn.hpp>
-#include <opencv2/imgproc.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -11,6 +8,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 
 namespace argus_inference {
 namespace {
@@ -182,7 +180,9 @@ bool YoloV8Segmentation::configureTensors() {
     }
     hostOutputs_.resize(outputs_.size());
     for (size_t index = 0; index < outputs_.size(); ++index) {
-        hostOutputs_[index].resize(outputs_[index].bytes / sizeof(float));
+        if (outputs_[index].dims.nbDims == 3) {
+            hostOutputs_[index].resize(outputs_[index].bytes / sizeof(float));
+        }
     }
     initialized_ = true;
     return true;
@@ -234,9 +234,17 @@ bool YoloV8Segmentation::infer(const void* rgbaDevice, size_t sourcePitch, int s
     }
     if (!context_->enqueueV3(stream_)) return false;
     if (cudaEventRecord(gpuInferenceEvent_, stream_) != cudaSuccess) return false;
+
+    int headIndex = -1;
+    int protoIndex = -1;
     for (size_t index = 0; index < outputs_.size(); ++index) {
-        if (cudaMemcpyAsync(hostOutputs_[index].data(), outputs_[index].device, outputs_[index].bytes,
-                            cudaMemcpyDeviceToHost, stream_) != cudaSuccess) return false;
+        if (outputs_[index].dims.nbDims == 3) headIndex = static_cast<int>(index);
+        if (outputs_[index].dims.nbDims == 4) protoIndex = static_cast<int>(index);
+    }
+    if (headIndex < 0 || protoIndex < 0 || hostOutputs_[headIndex].empty()) return false;
+    if (cudaMemcpyAsync(hostOutputs_[headIndex].data(), outputs_[headIndex].device,
+                        outputs_[headIndex].bytes, cudaMemcpyDeviceToHost, stream_) != cudaSuccess) {
+        return false;
     }
     if (cudaEventRecord(gpuOutputCopyEvent_, stream_) != cudaSuccess ||
         cudaEventSynchronize(gpuOutputCopyEvent_) != cudaSuccess) return false;
@@ -252,13 +260,6 @@ bool YoloV8Segmentation::infer(const void* rgbaDevice, size_t sourcePitch, int s
         timing->outputCopyMs = outputCopyMs;
     }
 
-    int headIndex = -1;
-    int protoIndex = -1;
-    for (size_t index = 0; index < outputs_.size(); ++index) {
-        if (outputs_[index].dims.nbDims == 3) headIndex = static_cast<int>(index);
-        if (outputs_[index].dims.nbDims == 4) protoIndex = static_cast<int>(index);
-    }
-    if (headIndex < 0 || protoIndex < 0) return false;
     const auto& headDims = outputs_[headIndex].dims;
     const auto& protoDims = outputs_[protoIndex].dims;
     if (headDims.d[0] != 1 || headDims.d[1] <= 4 || headDims.d[2] <= 0 ||
@@ -331,22 +332,34 @@ bool YoloV8Segmentation::infer(const void* rgbaDevice, size_t sourcePitch, int s
     }
 
     const auto maskDecodeStart = std::chrono::steady_clock::now();
-    const auto& proto = hostOutputs_[protoIndex];
-    cv::Mat protoMatrix(maskDimensions, protoDims.d[2] * protoDims.d[3], CV_32F,
-                        const_cast<float*>(proto.data()));
+    std::vector<MaskDecodeRoi> maskRois;
+    std::vector<float> maskCoefficients;
+    std::vector<unsigned char> masks;
+    maskRois.reserve(keep.size());
+    maskCoefficients.reserve(keep.size() * static_cast<size_t>(maskDimensions));
+    size_t maskOffset = 0;
     for (const int index : keep) {
-        auto& candidate = candidates[index];
-        cv::Mat coefficients(1, maskDimensions, CV_32F, candidate.coefficients.data());
-        cv::Mat mask = coefficients * protoMatrix;
-        mask = mask.reshape(1, protoDims.d[2]);
-        cv::exp(-mask, mask);
-        mask = 1.0F / (1.0F + mask);
-        cv::resize(mask, mask, cv::Size(inputSize_, inputSize_), 0.0, 0.0, cv::INTER_LINEAR);
-        const cv::Rect valid(letterbox.paddingX, letterbox.paddingY,
-                             inputSize_ - 2 * letterbox.paddingX, inputSize_ - 2 * letterbox.paddingY);
-        cv::resize(mask(valid), mask, cv::Size(sourceWidth, sourceHeight), 0.0, 0.0, cv::INTER_LINEAR);
-        cv::threshold(mask(candidate.instance.box), candidate.instance.mask, 0.5, 255.0, cv::THRESH_BINARY);
-        candidate.instance.mask.convertTo(candidate.instance.mask, CV_8U);
+        if (index < 0 || index >= static_cast<int>(candidates.size())) return false;
+        const auto& candidate = candidates[index];
+        const auto& box = candidate.instance.box;
+        if (box.width <= 0 || box.height <= 0 ||
+            static_cast<size_t>(box.width) > std::numeric_limits<size_t>::max() / box.height) return false;
+        const size_t maskBytes = static_cast<size_t>(box.width) * box.height;
+        if (maskOffset > std::numeric_limits<size_t>::max() - maskBytes) return false;
+        maskRois.push_back(MaskDecodeRoi{box.x, box.y, box.width, box.height, maskOffset});
+        maskCoefficients.insert(maskCoefficients.end(), candidate.coefficients.begin(), candidate.coefficients.end());
+        maskOffset += maskBytes;
+    }
+    if (!maskRois.empty() &&
+        !maskDecoder_.decode(static_cast<const float*>(outputs_[protoIndex].device), maskDimensions,
+                             protoDims.d[2], protoDims.d[3], maskCoefficients, maskRois,
+                             sourceWidth, sourceHeight, inputSize_, letterbox.paddingX,
+                             letterbox.paddingY, stream_, &masks)) return false;
+    for (size_t keepIndex = 0; keepIndex < keep.size(); ++keepIndex) {
+        auto& candidate = candidates[keep[keepIndex]];
+        const auto& roi = maskRois[keepIndex];
+        candidate.instance.mask = cv::Mat(roi.height, roi.width, CV_8U,
+                                          masks.data() + roi.outputOffset).clone();
         instances->push_back(std::move(candidate.instance));
     }
     std::sort(instances->begin(), instances->end(), [](const auto& left, const auto& right) {

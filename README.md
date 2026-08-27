@@ -117,8 +117,9 @@ engine 构建逻辑。它直接将采集 dma-buf 作为 VIC 的 YUV 输入，转
 随后通过 `NvBufSurfaceMapEglImage` 和 CUDA EGL interop 取得 RGBA
 device pointer，由 CUDA kernel 完成双线性 letterbox、RGB 排列、CHW 与 `[0, 1]` 归一化，
 并直接写入 TensorRT input buffer。图像不映射到 CPU，也没有 host-to-device 输入复制。
-检测头和 mask prototype 在节点内
-完成类别 NMS、坐标反变换与实例掩码解码；只有模型输出和最终发布的分割结果会回到 CPU。
+检测头在节点内回传 CPU 完成类别 NMS 与坐标反变换；mask prototype 始终保留在 GPU，CUDA kernel
+使用 NMS 保留目标的系数直接解码、缩放并二值化各自的 ROI 掩码。只有检测头和最终发布的
+ROI 分割结果会回到 CPU。
 可视化节点直接使用同一采集 dma-buf 进行 JPEG 编码。
 
 分割结果发布到 `/camera/inference/segmentation`，类型为

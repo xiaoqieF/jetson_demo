@@ -35,7 +35,7 @@ endif()
 
 add_library(${PROJECT_NAME} SHARED
   src/inference_node.cpp
-  src/cuda_preprocess.cu
+  src/cuda_kernels.cu
   src/yolov8_segmentation.cpp
   ${JETSON_MMAPI_NVBUFSURFACE_SOURCE})
 target_include_directories(${PROJECT_NAME} PRIVATE
