@@ -12,7 +12,6 @@ def generate_launch_description():
         'sensor_mode_index': ParameterValue(
             LaunchConfiguration('sensor_mode_index'), value_type=int),
         'frame_count': ParameterValue(LaunchConfiguration('frame_count'), value_type=int),
-        'fifo_length': ParameterValue(LaunchConfiguration('fifo_length'), value_type=int),
         'capture_buffer_count': ParameterValue(
             LaunchConfiguration('capture_buffer_count'), value_type=int),
         'frame_rate': ParameterValue(LaunchConfiguration('frame_rate'), value_type=float),
@@ -50,8 +49,7 @@ def generate_launch_description():
         DeclareLaunchArgument('camera_index', default_value='0'),
         DeclareLaunchArgument('sensor_mode_index', default_value='4'),
         DeclareLaunchArgument('frame_count', default_value='0'),
-        DeclareLaunchArgument('fifo_length', default_value='8'),
-        DeclareLaunchArgument('capture_buffer_count', default_value='8'),
+        DeclareLaunchArgument('capture_buffer_count', default_value='4'),
         DeclareLaunchArgument('frame_rate', default_value='0.0'),
         DeclareLaunchArgument('frame_id', default_value='camera'),
         container,

@@ -42,8 +42,7 @@ ArgusCameraNode::ArgusCameraNode(const rclcpp::NodeOptions& options)
     requestedFrames_ = declare_parameter<int64_t>("frame_count", 0);
     cameraIndex_ = declare_parameter<int>("camera_index", 0);
     sensorModeIndex_ = declare_parameter<int>("sensor_mode_index", 0);
-    fifoLength_ = declare_parameter<int>("fifo_length", 8);
-    captureBufferCount_ = declare_parameter<int>("capture_buffer_count", fifoLength_);
+    captureBufferCount_ = declare_parameter<int>("capture_buffer_count", 4);
     frameRate_ = declare_parameter<double>("frame_rate", 0.0);
     controls_.frameRate = frameRate_;
     controls_.saturation = static_cast<float>(declare_parameter<double>("saturation", 1.0));
@@ -61,7 +60,7 @@ ArgusCameraNode::ArgusCameraNode(const rclcpp::NodeOptions& options)
     const auto whiteBalanceGains = declare_parameter<std::vector<double>>(
         "white_balance_gains", {1.0, 1.0, 1.0, 1.0});
 
-    if (requestedFrames_ < 0 || cameraIndex_ < 0 || sensorModeIndex_ < 0 || fifoLength_ <= 0 ||
+    if (requestedFrames_ < 0 || cameraIndex_ < 0 || sensorModeIndex_ < 0 ||
         captureBufferCount_ < 2 ||
         !std::isfinite(frameRate_) || frameRate_ < 0.0 || frameRate_ > 1.0e9 ||
         controls_.saturation < 0.0f || controls_.saturation > 2.0f ||
@@ -80,7 +79,7 @@ ArgusCameraNode::ArgusCameraNode(const rclcpp::NodeOptions& options)
         static_cast<float>(whiteBalanceGains[2]), static_cast<float>(whiteBalanceGains[3]));
 
     publisher_ = create_publisher<argus_transport::ArgusFramePacket>(
-        topic, rclcpp::QoS(rclcpp::KeepLast(8)).reliable());
+        topic, rclcpp::QoS(rclcpp::KeepLast(4)).best_effort());
     if (!start()) throw std::runtime_error("Argus camera start failed");
 }
 

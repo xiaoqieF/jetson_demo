@@ -42,8 +42,7 @@ private:
     int64_t requestedFrames_ = 0;
     int cameraIndex_ = 0;
     int sensorModeIndex_ = 0;
-    int fifoLength_ = 8;
-    int captureBufferCount_ = 8;
+    int captureBufferCount_ = 4;
     double frameRate_ = 0.0;
     std::string frameId_;
     std::atomic<bool> quit_{false};

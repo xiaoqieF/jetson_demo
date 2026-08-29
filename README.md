@@ -172,7 +172,7 @@ ros2 launch argus_bringup argus_pipeline.launch.py
 ```bash
 ros2 launch argus_bringup argus_pipeline.launch.py \
   camera_index:=0 sensor_mode_index:=0 frame_count:=100 \
-  capture_buffer_count:=8 frame_rate:=30 frame_id:=camera
+  capture_buffer_count:=4 frame_rate:=30 frame_id:=camera
 ```
 
 `camera_index` 和 `sensor_mode_index` 分别选择 LibArgus 枚举到的摄像头与 sensor mode；
@@ -197,10 +197,11 @@ ros2 topic echo /camera/image/compressed --once
 ros2 run rqt_image_view rqt_image_view
 ```
 
-自定义 YUV handle topic 使用 reliable/keep-last（深度 8）；intra-process communication
-要求使用 keep-last 历史策略。JPEG 输出使用 `SensorDataQoS`（best effort）。采集 NVMM
-pool 默认包含 8 个 buffer，可使用 `capture_buffer_count` 修改；应结合实际处理时延、下游
-队列深度与允许的帧数延迟调整。
+自定义 YUV handle topic 使用 best-effort/keep-last（相机发布端深度为 4，JPEG 可视化节点
+深度为 1）；intra-process communication 要求使用 keep-last 历史策略。JPEG 输出使用
+`SensorDataQoS`（best effort）。采集 NVMM pool 默认包含 4 个 buffer，可使用
+`capture_buffer_count` 修改；
+应结合实际处理时延、下游队列深度与允许的帧数延迟调整。
 
 YUV packet 使用 keep-last 队列；如果消费者处理速度低于采集速度，最旧的 packet 会被淘汰，
 其 shared owner 随之归还 Argus Buffer，避免 NVMM buffer 永久滞留。慢消费者耗尽 pool 时会

@@ -20,7 +20,7 @@ VisualizationNode::VisualizationNode(const rclcpp::NodeOptions& options)
     encoder_.reset(NvJPEGEncoder::createJPEGEncoder("argus_visualization_jpeg"));
     if (!encoder_) throw std::runtime_error("创建 NvJPEGEncoder 失败");
     subscription_ = create_subscription<argus_transport::ArgusFramePacket>(
-        inputTopic, rclcpp::QoS(rclcpp::KeepLast(8)).reliable(),
+        inputTopic, rclcpp::QoS(rclcpp::KeepLast(1)).best_effort(),
         [this](argus_transport::ArgusFramePacket::ConstSharedPtr message) {
             publishJpeg(*message);
         });
