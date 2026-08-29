@@ -24,7 +24,7 @@ InferenceNode::InferenceNode(const rclcpp::NodeOptions& options)
     inputTopic_ = declare_parameter<std::string>("input_topic", "/camera/image/yuv");
     const auto outputTopic = declare_parameter<std::string>(
         "output_topic", "/camera/inference/overlay/compressed");
-    const auto enginePath = declare_parameter<std::string>("engine_path", "/home/royfan/yolov8_trt/yolov8s-seg-640.engine");
+    const auto enginePath = declare_parameter<std::string>("engine_path", "/home/royfan/engine/yolov8s-seg-official_fp16.engine");
     inputSize_ = declare_parameter<int>("input_size", 640);
     const auto requireFp16Engine = declare_parameter<bool>("require_fp16_engine", true);
     const auto timingLogEveryNFrames = declare_parameter<int>("timing_log_every_n_frames", 30);
