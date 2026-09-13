@@ -45,6 +45,7 @@ private:
     int captureBufferCount_ = 4;
     double frameRate_ = 0.0;
     std::string frameId_;
+    std::string topic_;
     std::atomic<bool> quit_{false};
     std::atomic<bool> started_{false};
     continuous_capture::Controls controls_;

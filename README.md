@@ -167,18 +167,18 @@ ros2 launch argus_bringup argus_pipeline.launch.py
 ```
 
 组件默认按 inference、visualization、camera 顺序加载；相机组件不等待订阅者发现即可开始
-采集。以下常用参数可在 launch 命令中传入：
+采集。相机节点不再通过 ROS node parameter 接收配置，而是默认读取 `argus_camera` 安装目录
+下的 `config/argus_camera.yaml`。修改配置文件后重启节点即可生效，也可以通过环境变量
+`ARGUS_CAMERA_CONFIG` 指定其他 YAML 文件：
 
 ```bash
-ros2 launch argus_bringup argus_pipeline.launch.py \
-  camera_index:=0 sensor_mode_index:=0 frame_count:=100 \
-  capture_buffer_count:=4 frame_rate:=30 frame_id:=camera
+ARGUS_CAMERA_CONFIG=/path/to/argus_camera.yaml \
+  ros2 launch argus_bringup argus_pipeline.launch.py
 ```
 
 `camera_index` 和 `sensor_mode_index` 分别选择 LibArgus 枚举到的摄像头与 sensor mode；
 `frame_count=0` 表示持续采集；`frame_rate=0` 表示使用 sensor mode 默认帧率，否则按请求的
-FPS 设置采集帧周期（超出传感器支持范围时由 Argus 取最接近值）。采集节点还提供以下启动参数，
-适合写入 ROS 参数 YAML：
+FPS 设置采集帧周期（超出传感器支持范围时由 Argus 取最接近值）。配置文件字段如下：
 
 ```text
 topic, frame_id, frame_count, camera_index, sensor_mode_index, capture_buffer_count, frame_rate
@@ -188,7 +188,8 @@ edge_enhance_mode (off|fast|hq), edge_enhance_strength
 manual_white_balance, white_balance_gains: [r, g_even, g_odd, b]
 ```
 
-这些参数在组件启动时应用到 Argus request；运行中不再读取终端标准输入。
+这些配置在组件启动时读取并应用到 Argus request；运行中修改文件不会自动改变当前采集，
+需要重启节点。
 
 查看可视化输出：
 

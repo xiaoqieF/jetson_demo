@@ -2,13 +2,17 @@
 
 #include "argus_camera/camera_controls.hpp"
 
+#include <ament_index_cpp/get_package_share_directory.hpp>
 #include <Argus/Argus.h>
 #include <Argus/CaptureMetadata.h>
 #include <NvBufSurface.h>
+#include <yaml-cpp/yaml.h>
 
 #include <EGL/egl.h>
 
 #include <cmath>
+#include <cstdlib>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -33,53 +37,96 @@ bool parseEdgeEnhanceMode(const std::string& value, Argus::EdgeEnhanceMode* mode
     else return false;
     return true;
 }
+
+template<typename T>
+T readConfigValue(const YAML::Node& config, const char* key, const T& defaultValue) {
+    const auto value = config[key];
+    return value ? value.as<T>() : defaultValue;
+}
+
+std::string configPath() {
+    if (const char* configuredPath = std::getenv("ARGUS_CAMERA_CONFIG");
+        configuredPath != nullptr && configuredPath[0] != '\0') {
+        return configuredPath;
+    }
+    return (std::filesystem::path(
+                ament_index_cpp::get_package_share_directory("argus_camera")) /
+            "config/argus_camera.yaml").string();
+}
+
+void loadConfig(const std::string& path, std::string* topic, std::string* frameId,
+                int64_t* requestedFrames, int* cameraIndex, int* sensorModeIndex,
+                int* captureBufferCount, double* frameRate,
+                continuous_capture::Controls* controls) {
+    YAML::Node config;
+    try {
+        config = YAML::LoadFile(path);
+    } catch (const YAML::Exception& exception) {
+        throw std::invalid_argument("无法读取 Argus camera 配置文件 " + path + ": " + exception.what());
+    }
+    if (!config || !config.IsMap()) {
+        throw std::invalid_argument("Argus camera 配置文件必须是 YAML 对象: " + path);
+    }
+
+    *topic = readConfigValue(config, "topic", std::string("/camera/image/yuv"));
+    *frameId = readConfigValue(config, "frame_id", std::string("camera"));
+    *requestedFrames = readConfigValue(config, "frame_count", int64_t{0});
+    *cameraIndex = readConfigValue(config, "camera_index", 0);
+    *sensorModeIndex = readConfigValue(config, "sensor_mode_index", 0);
+    *captureBufferCount = readConfigValue(config, "capture_buffer_count", 4);
+    *frameRate = readConfigValue(config, "frame_rate", 0.0);
+    controls->frameRate = *frameRate;
+    controls->saturation = readConfigValue(config, "saturation", 1.0f);
+    controls->exposureCompensation = readConfigValue(config, "exposure_compensation", 0.0f);
+    controls->ispDigitalGain = readConfigValue(config, "isp_digital_gain", 1.0f);
+    controls->denoiseStrength = readConfigValue(config, "denoise_strength", 1.0f);
+    controls->edgeStrength = readConfigValue(config, "edge_enhance_strength", 1.0f);
+    controls->manualWb = readConfigValue(config, "manual_white_balance", false);
+
+    const auto denoiseMode = readConfigValue(config, "denoise_mode", std::string("fast"));
+    const auto edgeEnhanceMode = readConfigValue(config, "edge_enhance_mode", std::string("fast"));
+    const auto whiteBalanceGains = readConfigValue(
+        config, "white_balance_gains", std::vector<double>{1.0, 1.0, 1.0, 1.0});
+    if (!parseDenoiseMode(denoiseMode, &controls->denoiseMode) ||
+        !parseEdgeEnhanceMode(edgeEnhanceMode, &controls->edgeMode) ||
+        whiteBalanceGains.size() != 4) {
+        throw std::invalid_argument("Argus camera 配置文件中的模式或 white_balance_gains 无效: " + path);
+    }
+    for (const auto gain : whiteBalanceGains) {
+        if (gain <= 0.0) {
+            throw std::invalid_argument("white_balance_gains 必须为正数: " + path);
+        }
+    }
+    controls->wbGains = Argus::BayerTuple<float>(
+        static_cast<float>(whiteBalanceGains[0]), static_cast<float>(whiteBalanceGains[1]),
+        static_cast<float>(whiteBalanceGains[2]), static_cast<float>(whiteBalanceGains[3]));
+}
+
+void validateConfig(const std::string& path, int64_t requestedFrames, int cameraIndex,
+                    int sensorModeIndex, int captureBufferCount, double frameRate,
+                    const continuous_capture::Controls& controls) {
+    if (requestedFrames < 0 || cameraIndex < 0 || sensorModeIndex < 0 || captureBufferCount < 2 ||
+        !std::isfinite(frameRate) || frameRate < 0.0 || frameRate > 1.0e9 ||
+        controls.saturation < 0.0f || controls.saturation > 2.0f ||
+        controls.ispDigitalGain <= 0.0f || controls.denoiseStrength < 0.0f ||
+        controls.denoiseStrength > 1.0f || controls.edgeStrength < 0.0f ||
+        controls.edgeStrength > 1.0f) {
+        throw std::invalid_argument("Argus camera 配置参数无效: " + path);
+    }
+}
 }  // namespace
 
 ArgusCameraNode::ArgusCameraNode(const rclcpp::NodeOptions& options)
     : Node("argus_camera_node", options) {
-    const auto topic = declare_parameter<std::string>("topic", "/camera/image/yuv");
-    frameId_ = declare_parameter<std::string>("frame_id", "camera");
-    requestedFrames_ = declare_parameter<int64_t>("frame_count", 0);
-    cameraIndex_ = declare_parameter<int>("camera_index", 0);
-    sensorModeIndex_ = declare_parameter<int>("sensor_mode_index", 0);
-    captureBufferCount_ = declare_parameter<int>("capture_buffer_count", 4);
-    frameRate_ = declare_parameter<double>("frame_rate", 0.0);
-    controls_.frameRate = frameRate_;
-    controls_.saturation = static_cast<float>(declare_parameter<double>("saturation", 1.0));
-    controls_.exposureCompensation = static_cast<float>(
-        declare_parameter<double>("exposure_compensation", 0.0));
-    controls_.ispDigitalGain = static_cast<float>(
-        declare_parameter<double>("isp_digital_gain", 1.0));
-    controls_.denoiseStrength = static_cast<float>(
-        declare_parameter<double>("denoise_strength", 1.0));
-    controls_.edgeStrength = static_cast<float>(
-        declare_parameter<double>("edge_enhance_strength", 1.0));
-    controls_.manualWb = declare_parameter<bool>("manual_white_balance", false);
-    const auto denoiseMode = declare_parameter<std::string>("denoise_mode", "fast");
-    const auto edgeEnhanceMode = declare_parameter<std::string>("edge_enhance_mode", "fast");
-    const auto whiteBalanceGains = declare_parameter<std::vector<double>>(
-        "white_balance_gains", {1.0, 1.0, 1.0, 1.0});
-
-    if (requestedFrames_ < 0 || cameraIndex_ < 0 || sensorModeIndex_ < 0 ||
-        captureBufferCount_ < 2 ||
-        !std::isfinite(frameRate_) || frameRate_ < 0.0 || frameRate_ > 1.0e9 ||
-        controls_.saturation < 0.0f || controls_.saturation > 2.0f ||
-        controls_.ispDigitalGain <= 0.0f || controls_.denoiseStrength < 0.0f ||
-        controls_.denoiseStrength > 1.0f || controls_.edgeStrength < 0.0f ||
-        controls_.edgeStrength > 1.0f || whiteBalanceGains.size() != 4 ||
-        !parseDenoiseMode(denoiseMode, &controls_.denoiseMode) ||
-        !parseEdgeEnhanceMode(edgeEnhanceMode, &controls_.edgeMode)) {
-        throw std::invalid_argument("Argus camera parameter is invalid");
-    }
-    for (const auto gain : whiteBalanceGains) {
-        if (gain <= 0.0) throw std::invalid_argument("white_balance_gains must be positive");
-    }
-    controls_.wbGains = Argus::BayerTuple<float>(
-        static_cast<float>(whiteBalanceGains[0]), static_cast<float>(whiteBalanceGains[1]),
-        static_cast<float>(whiteBalanceGains[2]), static_cast<float>(whiteBalanceGains[3]));
+    const auto path = configPath();
+    loadConfig(path, &topic_, &frameId_, &requestedFrames_, &cameraIndex_, &sensorModeIndex_,
+               &captureBufferCount_, &frameRate_, &controls_);
+    validateConfig(path, requestedFrames_, cameraIndex_, sensorModeIndex_, captureBufferCount_,
+                   frameRate_, controls_);
+    RCLCPP_INFO(get_logger(), "已加载 Argus camera 配置: %s", path.c_str());
 
     publisher_ = create_publisher<argus_transport::ArgusFramePacket>(
-        topic, rclcpp::QoS(rclcpp::KeepLast(4)).best_effort());
+        topic_, rclcpp::QoS(rclcpp::KeepLast(4)).best_effort());
     if (!start()) throw std::runtime_error("Argus camera start failed");
 }
 
@@ -89,32 +136,45 @@ ArgusCameraNode::~ArgusCameraNode() {
 }
 
 bool ArgusCameraNode::start() {
-    if (started_.exchange(true)) return true;
+    if (started_.exchange(true)) {
+        return true;
+    }
     provider_.reset(Argus::CameraProvider::create());
     iProvider_ = Argus::interface_cast<Argus::ICameraProvider>(provider_);
     if (!continuous_capture::check(iProvider_ != nullptr,
-                                   "无法获取 ICameraProvider，请检查 nvargus-daemon")) return false;
+                                   "无法获取 ICameraProvider，请检查 nvargus-daemon")) {
+        return false;
+    }
+
     std::vector<Argus::CameraDevice*> devices;
     if (!continuous_capture::ok(iProvider_->getCameraDevices(&devices), "枚举摄像头失败") ||
         !continuous_capture::check(cameraIndex_ < static_cast<int>(devices.size()),
-                                   "camera_index 超出可用摄像头范围")) return false;
+                                   "camera_index 超出可用摄像头范围")) {
+        return false;
+    }
     auto* device = devices[cameraIndex_];
     auto* properties = Argus::interface_cast<Argus::ICameraProperties>(device);
     std::vector<Argus::SensorMode*> modes;
     if (!continuous_capture::check(properties != nullptr, "无法获取相机属性") ||
         !continuous_capture::ok(properties->getAllSensorModes(&modes), "枚举 sensor mode 失败") ||
         !continuous_capture::check(sensorModeIndex_ < static_cast<int>(modes.size()),
-                                   "sensor_mode_index 超出可用 sensor mode 范围")) return false;
+                                   "sensor_mode_index 超出可用 sensor mode 范围")) {
+        return false;
+    }
     for (size_t index = 0; index < modes.size(); ++index) {
         auto* modeInterface = Argus::interface_cast<Argus::ISensorMode>(modes[index]);
-        if (!modeInterface) continue;
+        if (!modeInterface) {
+            continue;
+        }
         const auto modeResolution = modeInterface->getResolution();
         RCLCPP_INFO(get_logger(), "sensor_mode_index=%zu：%ux%u", index,
                     modeResolution.width(), modeResolution.height());
     }
     sensorMode_ = modes[sensorModeIndex_];
     auto* sensorModeInterface = Argus::interface_cast<Argus::ISensorMode>(sensorMode_);
-    if (!continuous_capture::check(sensorModeInterface != nullptr, "无法获取 sensor mode 接口")) return false;
+    if (!continuous_capture::check(sensorModeInterface != nullptr, "无法获取 sensor mode 接口")) {
+        return false;
+    }
     resolution_ = sensorModeInterface->getResolution();
     const auto frameDurationRange = sensorModeInterface->getFrameDurationRange();
     RCLCPP_INFO(get_logger(),
@@ -129,19 +189,27 @@ bool ArgusCameraNode::start() {
     Argus::Status status = Argus::STATUS_OK;
     session_.reset(iProvider_->createCaptureSession(device, &status));
     if (!continuous_capture::ok(status, "创建 CaptureSession 失败") ||
-        !continuous_capture::check(static_cast<bool>(session_), "CaptureSession 为空")) return false;
+        !continuous_capture::check(static_cast<bool>(session_), "CaptureSession 为空")) {
+        return false;
+    }
     iSession_ = Argus::interface_cast<Argus::ICaptureSession>(session_);
     settings_.reset(iSession_->createOutputStreamSettings(Argus::STREAM_TYPE_BUFFER));
     auto* streamSettings = Argus::interface_cast<Argus::IBufferOutputStreamSettings>(settings_);
     if (!continuous_capture::check(streamSettings != nullptr, "无法获取 stream settings") ||
         !continuous_capture::ok(streamSettings->setBufferType(Argus::BUFFER_TYPE_EGL_IMAGE),
-                                "设置 EGLImage buffer 类型失败")) return false;
+                                "设置 EGLImage buffer 类型失败")) {
+        return false;
+    }
     streamSettings->setMetadataEnable(true);
     stream_.reset(iSession_->createOutputStream(settings_.get(), &status));
     if (!continuous_capture::ok(status, "创建 OutputStream 失败") ||
-        !continuous_capture::check(static_cast<bool>(stream_), "OutputStream 为空")) return false;
+        !continuous_capture::check(static_cast<bool>(stream_), "OutputStream 为空")) {
+        return false;
+    }
     iBufferStream_ = Argus::interface_cast<Argus::IBufferOutputStream>(stream_);
-    if (!continuous_capture::check(iBufferStream_ != nullptr, "创建 BufferOutputStream 失败")) return false;
+    if (!continuous_capture::check(iBufferStream_ != nullptr, "创建 BufferOutputStream 失败")) {
+        return false;
+    }
     bufferReleaseState_ = std::make_shared<argus_transport::ArgusBufferReleaseState>();
     bufferReleaseState_->setStream(iBufferStream_);
     if (!createCaptureBufferPool()) {
@@ -190,7 +258,7 @@ bool ArgusCameraNode::createCaptureBufferPool() {
     params.params.width = resolution_.width();
     params.params.height = resolution_.height();
     params.params.colorFormat = NVBUF_COLOR_FORMAT_NV12;
-    params.params.layout = NVBUF_LAYOUT_BLOCK_LINEAR;
+    params.params.layout = NVBUF_LAYOUT_BLOCK_LINEAR;       // block-linear layout for Argus capture
     params.params.memType = NVBUF_MEM_SURFACE_ARRAY;
     params.memtag = NvBufSurfaceTag_CAMERA;
     for (int index = 0; index < captureBufferCount_; ++index) {

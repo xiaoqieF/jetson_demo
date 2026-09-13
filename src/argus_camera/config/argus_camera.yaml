@@ -1,0 +1,18 @@
+topic: /camera/image/yuv
+frame_id: camera
+
+camera_index: 0
+sensor_mode_index: 4
+frame_count: 0
+capture_buffer_count: 4
+frame_rate: 0.0
+
+saturation: 1.0
+exposure_compensation: 0.0
+isp_digital_gain: 1.0
+denoise_mode: fast
+denoise_strength: 1.0
+edge_enhance_mode: fast
+edge_enhance_strength: 1.0
+manual_white_balance: false
+white_balance_gains: [1.0, 1.0, 1.0, 1.0]

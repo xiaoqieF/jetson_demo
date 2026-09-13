@@ -9,11 +9,13 @@ set(JETSON_MMAPI_ROOT "/usr/src/jetson_multimedia_api" CACHE PATH "Jetson Multim
 set(JETSON_MMAPI_INCLUDE_DIR "${JETSON_MMAPI_ROOT}/include" CACHE PATH "Jetson Multimedia API include")
 
 find_package(ament_cmake REQUIRED)
+find_package(ament_index_cpp REQUIRED)
 find_package(Threads REQUIRED)
 find_package(argus_interfaces REQUIRED)
 find_package(argus_transport REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
+find_package(yaml-cpp REQUIRED)
 find_path(ARGUS_INCLUDE_DIR Argus/Argus.h HINTS "${ARGUS_INCLUDE_DIR}" REQUIRED)
 find_path(JETSON_MMAPI_INCLUDE_DIR NvBufSurface.h HINTS "${JETSON_MMAPI_INCLUDE_DIR}" REQUIRED)
 find_library(NVARGUS_SOCKETCLIENT_LIBRARY nvargus_socketclient
@@ -28,13 +30,14 @@ add_library(${PROJECT_NAME} SHARED
   src/argus_camera_node.cpp
   src/camera_controls.cpp)
 target_include_directories(${PROJECT_NAME} PRIVATE src "${JETSON_MMAPI_INCLUDE_DIR}" PUBLIC include "${ARGUS_INCLUDE_DIR}")
-ament_target_dependencies(${PROJECT_NAME} argus_interfaces argus_transport rclcpp rclcpp_components)
+ament_target_dependencies(${PROJECT_NAME} ament_index_cpp argus_interfaces argus_transport rclcpp rclcpp_components)
 target_link_libraries(${PROJECT_NAME}
-  "${NVARGUS_SOCKETCLIENT_LIBRARY}" "${NVBUFSURFACE_LIBRARY}" "${EGL_LIBRARY}" Threads::Threads)
+  "${NVARGUS_SOCKETCLIENT_LIBRARY}" "${NVBUFSURFACE_LIBRARY}" "${EGL_LIBRARY}" Threads::Threads yaml-cpp)
 rclcpp_components_register_nodes(${PROJECT_NAME} "argus_camera::ArgusCameraNode")
 
 install(TARGETS ${PROJECT_NAME} DESTINATION lib)
 install(DIRECTORY include/ DESTINATION include)
+install(DIRECTORY config/ DESTINATION share/${PROJECT_NAME}/config)
 ament_export_include_directories(include "${ARGUS_INCLUDE_DIR}")
 ament_export_libraries(${PROJECT_NAME})
 ament_package()
