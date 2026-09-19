@@ -1,6 +1,7 @@
 #pragma once
 
 #include <argus_transport/argus_frame_packet.hpp>
+#include <argus_interfaces/msg/argus_inference_result.hpp>
 #include <argus_inference/yolov8_segmentation.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/compressed_image.hpp>
@@ -54,6 +55,9 @@ private:
     // 发布示例分割可视化，十分耗时
     bool publishOverlay(const StagingSlot& slot,
                        const std::vector<SegmentationInstance>& instances);
+    void publishInferenceResult(const StagingSlot& slot,
+                                const std::vector<SegmentationInstance>& instances,
+                                float inferenceMs);
     bool copyYuvToRgbaGpu(StagingSlot* slot, void** rgbaDevice, size_t* sourcePitch);
     bool initializeSlotSurface(StagingSlot* slot);
     bool initializeSlotCudaInterop(StagingSlot* slot);
@@ -62,6 +66,7 @@ private:
 
     rclcpp::Subscription<argus_transport::ArgusFramePacket>::SharedPtr subscription_;
     rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr publisher_;
+    rclcpp::Publisher<argus_interfaces::msg::ArgusInferenceResult>::SharedPtr resultPublisher_;
     std::unique_ptr<YoloV8Segmentation> model_;
     std::string inputTopic_;
     int inputSize_ = 640;

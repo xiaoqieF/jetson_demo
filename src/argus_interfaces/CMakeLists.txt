@@ -8,6 +8,7 @@ find_package(std_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ArgusYuvFrame.msg"
   "msg/ArgusInstanceSegmentation.msg"
+  "msg/ArgusQwenDescription.msg"
   "msg/ArgusInferenceResult.msg"
   DEPENDENCIES std_msgs)
 

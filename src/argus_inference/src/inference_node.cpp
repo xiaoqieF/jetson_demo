@@ -24,6 +24,8 @@ InferenceNode::InferenceNode(const rclcpp::NodeOptions& options)
     inputTopic_ = declare_parameter<std::string>("input_topic", "/camera/image/yuv");
     const auto outputTopic = declare_parameter<std::string>(
         "output_topic", "/camera/inference/overlay/compressed");
+    const auto resultTopic = declare_parameter<std::string>(
+        "result_topic", "/camera/inference/result");
     const auto enginePath = declare_parameter<std::string>("engine_path", "/home/royfan/engine/yolov8s-seg-official_fp16.engine");
     inputSize_ = declare_parameter<int>("input_size", 640);
     const auto requireFp16Engine = declare_parameter<bool>("require_fp16_engine", true);
@@ -51,6 +53,8 @@ InferenceNode::InferenceNode(const rclcpp::NodeOptions& options)
         publisher_ = create_publisher<sensor_msgs::msg::CompressedImage>(
             outputTopic, rclcpp::QoS(rclcpp::KeepLast(1)).best_effort());
     }
+    resultPublisher_ = create_publisher<argus_interfaces::msg::ArgusInferenceResult>(
+        resultTopic, rclcpp::QoS(rclcpp::KeepLast(4)).best_effort());
     inferenceThread_ = std::thread(&InferenceNode::inferenceLoop, this);
     subscription_ = create_subscription<argus_transport::ArgusFramePacket>(
         inputTopic_, rclcpp::QoS(rclcpp::KeepLast(1)).best_effort(),
@@ -372,6 +376,29 @@ bool InferenceNode::publishOverlay(
     return true;
 }
 
+void InferenceNode::publishInferenceResult(
+    const StagingSlot& slot, const std::vector<SegmentationInstance>& instances, float inferenceMs) {
+    argus_interfaces::msg::ArgusInferenceResult message;
+    message.header = slot.header;
+    message.frame_number = slot.frameNumber;
+    message.image_width = slot.width;
+    message.image_height = slot.height;
+    message.inference_ms = inferenceMs;
+    message.instances.reserve(instances.size());
+    for (const auto& instance : instances) {
+        argus_interfaces::msg::ArgusInstanceSegmentation item;
+        item.class_id = instance.classId;
+        item.class_name = instance.className;
+        item.confidence = instance.confidence;
+        item.x_min = static_cast<float>(instance.box.x);
+        item.y_min = static_cast<float>(instance.box.y);
+        item.x_max = static_cast<float>(instance.box.x + instance.box.width);
+        item.y_max = static_cast<float>(instance.box.y + instance.box.height);
+        message.instances.push_back(std::move(item));
+    }
+    resultPublisher_->publish(std::move(message));
+}
+
 void InferenceNode::inferFrame(PendingFrame frame) {
     void* rgbaDevice = nullptr;
     size_t sourcePitch = 0;
@@ -401,6 +428,7 @@ void InferenceNode::inferFrame(PendingFrame frame) {
     if (enableOverlay_) {
         publishOverlay(slot, instances);
     }
+    publishInferenceResult(slot, instances, modelTiming.totalMs);
     ++processedFrames_;
     if (processedFrames_ % timingLogEveryNFrames_ == 0) {
         RCLCPP_INFO(

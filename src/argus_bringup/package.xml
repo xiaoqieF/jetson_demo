@@ -10,5 +10,6 @@
   <exec_depend>argus_camera</exec_depend>
   <exec_depend>argus_inference</exec_depend>
   <exec_depend>argus_visualization</exec_depend>
+  <exec_depend>qwen_description</exec_depend>
   <export><build_type>ament_cmake</build_type></export>
 </package>
