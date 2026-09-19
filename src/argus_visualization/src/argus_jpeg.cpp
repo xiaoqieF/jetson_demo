@@ -24,7 +24,7 @@ bool encodeFrameToJpeg(int dmabuf, NvJPEGEncoder* encoder,
     auto output = std::make_unique<unsigned char[]>(outputCapacity);
     auto* outputData = output.get();
     unsigned long outputSize = outputCapacity;
-    if (encoder->encodeFromFd(dmabuf, JCS_YCbCr, &outputData, outputSize, 85) != 0) {
+    if (encoder->encodeFromFd(dmabuf, JCS_YCbCr, &outputData, outputSize, 95) != 0) {
         return check(false, "JPEG 编码失败");
     }
     if (!check(outputData == output.get(), "JPEG 输出超出预分配缓冲区")) return false;

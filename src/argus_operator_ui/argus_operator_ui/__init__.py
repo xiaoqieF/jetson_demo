@@ -1,0 +1,1 @@
+"""Argus PC operator UI."""

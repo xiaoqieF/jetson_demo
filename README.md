@@ -1,5 +1,113 @@
 # LibArgus ROS2 同进程管线
 
+## PC Operator UI
+
+`argus_operator_ui` 是运行在 PC 上的 PySide6 客户端。它只订阅
+`/camera/image/compressed` 与 `/camera/inference/result`，不会订阅只能在 Orin 同进程使用的
+`/camera/image/yuv`，也不会在 PC 启动 YOLO 或 Qwen 模型。UI 在本地完成 JPEG 解码、检测框与
+实例 mask 绘制，并通过 `/camera/inference/qwen` Action 与 Orin 上的 Qwen3-VL 交互。
+
+> 当前 Orin 的 `argus_inference/src/inference_node.cpp` 只发布 bbox、类别与置信度，尚未填充
+> message 中的 mask 字段。因此当前实机画面只出现 bbox 是正常行为；PC 客户端已支持合法 mask，
+> 可用 `--demo` 立即验证透明 mask 叠加。
+
+### PC 依赖与编译
+
+PC 与 Orin 必须使用完全一致的 `argus_interfaces` 源码。Ubuntu 24.04 / ROS 2 Jazzy 上安装：
+
+```bash
+sudo apt update
+sudo apt install python3-opencv python3-numpy python3-pytest
+python3 -m pip install --user PySide6
+./scripts/build_pc.sh
+source install/setup.bash
+```
+
+构建脚本显式使用 `/usr/bin/python3`，避免已激活的 Conda Python（尤其不同 minor 版本）干扰
+ROS 2 Jazzy 的 Python 3.12 生成工具。
+
+如果系统启用了 PEP 668，推荐创建虚拟环境并允许访问 ROS 系统包：
+
+```bash
+python3 -m venv --system-site-packages .venv-ui
+source .venv-ui/bin/activate
+pip install PySide6
+./scripts/build_pc.sh
+source install/setup.bash
+```
+
+启动 UI：
+
+```bash
+ros2 run argus_operator_ui argus_operator_ui
+ros2 launch argus_operator_ui operator_ui.launch.py
+```
+
+topic 与 Action 名称可通过 ROS 参数覆盖：
+
+```bash
+ros2 run argus_operator_ui argus_operator_ui --ros-args \
+  -p image_topic:=/camera/image/compressed \
+  -p result_topic:=/camera/inference/result \
+  -p qwen_action_name:=/camera/inference/qwen
+```
+
+无 Orin 时可用合成画面验证 UI、bbox、mask 和退出流程：
+
+```bash
+ros2 run argus_operator_ui argus_operator_ui --demo
+ros2 run argus_operator_ui argus_operator_ui --demo --demo-video /path/to/video.mp4
+```
+
+### Orin 编译与启动
+
+在 Orin 仓库中执行（脚本跳过仅供 PC 使用的 UI package）：
+
+```bash
+./scripts/build_orin.sh
+source install/setup.bash
+ros2 launch argus_bringup argus_pipeline.launch.py
+```
+
+### ROS2 网络配置
+
+两台机器应在同一局域网，使用相同的 ROS domain 和兼容的 RMW 实现：
+
+```bash
+export ROS_DOMAIN_ID=0
+export ROS_LOCALHOST_ONLY=0
+```
+
+先在 PC 验证发现和数据流：
+
+```bash
+ros2 topic info /camera/image/compressed -v
+ros2 topic hz /camera/image/compressed
+ros2 action info /camera/inference/qwen
+```
+
+图像与 YOLO 订阅均为 best-effort/volatile/keep-last，网络抖动时会丢旧帧而不累积延迟。
+若跨机无法发现，检查两端 `ROS_DOMAIN_ID`、防火墙、组播/VLAN、RMW 实现，以及系统时间；
+本客户端的图像/结果匹配使用消息内同源 `header.stamp`，不依赖两台主机墙上时钟完全同步。
+
+### 线程与同步
+
+- Qt 主线程只更新控件与缩放已经生成的 `QImage`。
+- ROS worker 独占 node、executor、订阅 callback 和 Action client，短周期检查服务可用性。
+- 图像 worker 解码 JPEG、匹配消息、绘制 overlay 并转换 `QImage`；待处理图像槽始终只保留最新帧。
+- `FrameSynchronizer` 以 `sec * 1e9 + nanosec` 精确匹配，图像和结果缓存默认各 8 项、1.5 秒过期。
+- 新 JPEG 立即显示原图；对应结果稍后抵达时再显示同一帧 overlay，YOLO 跳帧不会阻塞视频。
+
+### UI 常见问题
+
+- Qwen 不可用：确认 Orin 的 Action Server 已启动，并执行 `ros2 action list -t`。
+- 只有原图没有框：检查 `/camera/inference/result`；没有检测结果不代表图像流离线。
+- 有框没有 mask：当前 Orin 发布逻辑尚未填写 mask，这是已知状态，可先用 demo 模式验证客户端。
+- UI 启动时报 Qt platform plugin 错误：确认 PC 有图形会话和 `DISPLAY`/Wayland 环境；SSH 场景使用
+  X11 转发或在本地桌面启动。
+- 关闭较慢：客户端会请求取消活跃 goal；服务端底层推理可能不能立即中断，但 worker join 有上限，
+  不会无限等待。
+
 这是一个 Jetson **LibArgus** 与 ROS2 的同进程图像管线：相机 node 创建并持有 NVMM
 YUV buffer pool，ISP 直接写入这些 surface；推理 node 和可视化 node 通过自定义消息共享
 同一个 dma-buf lease，不把采集图像复制到 CPU `sensor_msgs/Image`。
