@@ -25,7 +25,7 @@ QwenDescriptionNode::QwenDescriptionNode(const rclcpp::NodeOptions& options)
         "multimodal_engine_dir", "/home/royfan/qwen3-vl-2b/engines/int4");
     targetClasses_ = declare_parameter<std::vector<std::string>>("target_classes", std::vector<std::string>{"person"});
     minConfidence_ = declare_parameter<double>("min_confidence", 0.4);
-    maxGenerateLength_ = declare_parameter<int>("max_generate_length", 128);
+    maxGenerateLength_ = declare_parameter<int>("max_generate_length", 1024);
     temperature_ = declare_parameter<double>("temperature", 0.0);
     if (engineDir_.empty() || multimodalEngineDir_.empty() || maxGenerateLength_ <= 0 ||
         actionName_.empty() || minConfidence_ < 0.0 || minConfidence_ > 1.0 || temperature_ < 0.0) {
@@ -241,9 +241,10 @@ void QwenDescriptionNode::processGoal(
         trt_edgellm::rt::Message message;
         message.role = "user";
         message.contents.push_back({"image", ""});
-        const std::string prompt = goal->include_detection_context && haveDetection
+        std::string prompt = goal->include_detection_context && haveDetection
             ? buildPrompt(goal->prompt, detection)
             : goal->prompt;
+        prompt += "\n请给出简明、准确、完整的中文描述，字数不超过 1024 字。";
         message.contents.push_back({"text", prompt});
         trt_edgellm::rt::LLMGenerationRequest generationRequest;
         generationRequest.requests.resize(1);

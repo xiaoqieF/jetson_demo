@@ -73,9 +73,6 @@ class MainWindow(QMainWindow):
             QPushButton:disabled { background: #303943; color: #71808d; }
             QPushButton#cancelButton { background: #353e48; }
             QPushButton#cancelButton:hover { background: #48535f; }
-            QPushButton#clearButton { background: transparent; border: 1px solid #3a4652;
-                                      color: #aeb9c5; padding: 6px 11px; }
-            QPushButton#clearButton:hover { background: #29313b; color: #eef2f5; }
             QCheckBox { color: #aeb8c2; spacing: 6px; }
             QStatusBar { background: #0d1116; color: #98a5b2; border-top: 1px solid #252d35; }
             QSplitter::handle { background: #29313b; width: 1px; }
@@ -95,8 +92,6 @@ class MainWindow(QMainWindow):
         self.cancel = QPushButton("取消")
         self.cancel.setObjectName("cancelButton")
         self.cancel.setEnabled(False)
-        self.clear_chat = QPushButton("清除对话")
-        self.clear_chat.setObjectName("clearButton")
         self.state = QLabel("等待 ROS2…")
         self.state.setObjectName("statePill")
         self.state.setAlignment(Qt.AlignCenter)
@@ -132,7 +127,6 @@ class MainWindow(QMainWindow):
         header = QHBoxLayout()
         header.addLayout(header_text)
         header.addStretch(1)
-        header.addWidget(self.clear_chat)
         header.addWidget(QLabel("耗时"))
         header.addWidget(self.elapsed)
         right = QFrame()
@@ -162,7 +156,6 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.metrics)
         self.send.clicked.connect(self._send)
         self.cancel.clicked.connect(self._cancel)
-        self.clear_chat.clicked.connect(self._clear_chat)
         self.show_mask.toggled.connect(self._layers_changed)
         self.show_boxes.toggled.connect(self._layers_changed)
         bridge.frame.connect(self._on_frame)
@@ -203,12 +196,6 @@ class MainWindow(QMainWindow):
         if self._node:
             self.state.setText("正在请求取消")
             self._node.queue_cancel()
-
-    def _clear_chat(self) -> None:
-        self._messages.clear()
-        self.response.clear()
-        self.elapsed.setText("—")
-        self._set_error("")
 
     def _on_frame(self, image: QImage, stats: dict) -> None:
         self.video.set_image(image)
