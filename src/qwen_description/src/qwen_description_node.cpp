@@ -9,9 +9,38 @@
 #include <opencv2/imgproc.hpp>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 namespace qwen_description {
+namespace {
+
+std::string trimRepetitiveTail(std::string text) {
+    constexpr size_t kMinimumPatternBytes = 12;
+    constexpr size_t kRepeatCount = 3;
+
+    for (size_t start = 0; start + kMinimumPatternBytes * kRepeatCount <= text.size(); ++start) {
+        const size_t maximumPatternBytes = (text.size() - start) / kRepeatCount;
+        for (size_t patternBytes = kMinimumPatternBytes;
+             patternBytes <= maximumPatternBytes; ++patternBytes) {
+            const std::string_view pattern(text.data() + start, patternBytes);
+            bool repeated = true;
+            for (size_t repeat = 1; repeat < kRepeatCount; ++repeat) {
+                if (std::string_view(text.data() + start + repeat * patternBytes, patternBytes) != pattern) {
+                    repeated = false;
+                    break;
+                }
+            }
+            if (repeated) {
+                text.erase(start + patternBytes);
+                return text;
+            }
+        }
+    }
+    return text;
+}
+
+}  // namespace
 
 QwenDescriptionNode::QwenDescriptionNode(const rclcpp::NodeOptions& options)
     : Node("qwen_description_node", options) {
@@ -25,7 +54,7 @@ QwenDescriptionNode::QwenDescriptionNode(const rclcpp::NodeOptions& options)
         "multimodal_engine_dir", "/home/royfan/qwen3-vl-2b/engines/int4");
     targetClasses_ = declare_parameter<std::vector<std::string>>("target_classes", std::vector<std::string>{"person"});
     minConfidence_ = declare_parameter<double>("min_confidence", 0.4);
-    maxGenerateLength_ = declare_parameter<int>("max_generate_length", 1024);
+    maxGenerateLength_ = declare_parameter<int>("max_generate_length", 256);
     temperature_ = declare_parameter<double>("temperature", 0.0);
     if (engineDir_.empty() || multimodalEngineDir_.empty() || maxGenerateLength_ <= 0 ||
         actionName_.empty() || minConfidence_ < 0.0 || minConfidence_ > 1.0 || temperature_ < 0.0) {
@@ -244,7 +273,8 @@ void QwenDescriptionNode::processGoal(
         std::string prompt = goal->include_detection_context && haveDetection
             ? buildPrompt(goal->prompt, detection)
             : goal->prompt;
-        prompt += "\n请给出简明、准确、完整的中文描述，字数不超过 1024 字。";
+        prompt += "\n请只输出最终描述，不要复述提示词或分析过程。使用简明、准确、完整的中文，"
+                  "不超过 200 字，避免重复任何句子。";
         message.contents.push_back({"text", prompt});
         trt_edgellm::rt::LLMGenerationRequest generationRequest;
         generationRequest.requests.resize(1);
@@ -259,7 +289,7 @@ void QwenDescriptionNode::processGoal(
             generationResponse.outputTexts.empty()) {
             throw std::runtime_error("Qwen runtime handleRequest failed");
         }
-        output.description = generationResponse.outputTexts.front();
+        output.description = trimRepetitiveTail(generationResponse.outputTexts.front());
         output.success = true;
     } catch (const std::exception& error) {
         output.success = false;

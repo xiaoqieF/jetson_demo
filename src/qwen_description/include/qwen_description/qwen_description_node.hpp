@@ -76,7 +76,7 @@ private:
     std::string actionName_;
     std::vector<std::string> targetClasses_;
     double minConfidence_ = 0.4;
-    int maxGenerateLength_ = 128;
+    int maxGenerateLength_ = 256;
     double temperature_ = 0.0;
     std::string engineDir_;
     std::string multimodalEngineDir_;

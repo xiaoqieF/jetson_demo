@@ -3,7 +3,9 @@ set -euo pipefail
 
 workspace_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ros_distro="${ROS_DISTRO:-jazzy}"
+set +u
 source "/opt/ros/${ros_distro}/setup.bash"
+set -u
 
 cd "${workspace_dir}"
 colcon build --symlink-install --packages-skip argus_operator_ui \
