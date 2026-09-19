@@ -16,6 +16,7 @@ find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
 find_package(argus_interfaces REQUIRED)
 find_package(argus_transport REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_action REQUIRED)
 find_package(rclcpp_components REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_path(ARGUS_INCLUDE_DIR Argus/Argus.h HINTS "${ARGUS_ROOT}/include" REQUIRED)
@@ -50,7 +51,7 @@ add_library(${PROJECT_NAME} SHARED
 target_include_directories(${PROJECT_NAME} PRIVATE
   include "${ARGUS_INCLUDE_DIR}" "${JETSON_MMAPI_INCLUDE_DIR}" ${EDGE_LLM_COMMON_INCLUDES})
 ament_target_dependencies(${PROJECT_NAME}
-  argus_interfaces argus_transport rclcpp rclcpp_components sensor_msgs)
+  argus_interfaces argus_transport rclcpp rclcpp_action rclcpp_components sensor_msgs)
 target_link_libraries(${PROJECT_NAME}
   "${EDGE_LLM_BUILD}/cpp/libedgellmCore.a"
   "${EDGE_LLM_CUTEDSL_LIBRARY}"

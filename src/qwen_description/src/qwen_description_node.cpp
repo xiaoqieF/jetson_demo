@@ -18,19 +18,17 @@ QwenDescriptionNode::QwenDescriptionNode(const rclcpp::NodeOptions& options)
     inputTopic_ = declare_parameter<std::string>("input_topic", "/camera/image/compressed");
     detectionTopic_ = declare_parameter<std::string>("detection_topic", "/camera/inference/result");
     outputTopic_ = declare_parameter<std::string>("output_topic", "/camera/inference/qwen_description");
+    actionName_ = declare_parameter<std::string>("action_name", "/camera/inference/qwen");
     engineDir_ = declare_parameter<std::string>(
         "engine_dir", "/home/royfan/qwen3-vl-2b/engines/int4/llm");
     multimodalEngineDir_ = declare_parameter<std::string>(
         "multimodal_engine_dir", "/home/royfan/qwen3-vl-2b/engines/int4");
-    promptPrefix_ = declare_parameter<std::string>(
-        "prompt", "请查看整张图片，核验检测候选目标是否真实存在，并用中文简洁描述确认存在的目标及其周围环境。不要盲目相信检测结果，不要推测无法从图像确认的事实。");
     targetClasses_ = declare_parameter<std::vector<std::string>>("target_classes", std::vector<std::string>{"person"});
     minConfidence_ = declare_parameter<double>("min_confidence", 0.4);
     maxGenerateLength_ = declare_parameter<int>("max_generate_length", 128);
     temperature_ = declare_parameter<double>("temperature", 0.0);
-    inferenceEveryNFrames_ = static_cast<uint64_t>(declare_parameter<int>("inference_every_n_frames", 100));
     if (engineDir_.empty() || multimodalEngineDir_.empty() || maxGenerateLength_ <= 0 ||
-        minConfidence_ < 0.0 || minConfidence_ > 1.0 || temperature_ < 0.0 || inferenceEveryNFrames_ == 0) {
+        actionName_.empty() || minConfidence_ < 0.0 || minConfidence_ > 1.0 || temperature_ < 0.0) {
         throw std::invalid_argument("Qwen description parameter is invalid");
     }
 
@@ -59,17 +57,30 @@ QwenDescriptionNode::QwenDescriptionNode(const rclcpp::NodeOptions& options)
         [this](argus_interfaces::msg::ArgusInferenceResult::ConstSharedPtr result) {
             onDetection(std::move(result));
         });
+    actionServer_ = rclcpp_action::create_server<QwenInference>(
+        this, actionName_,
+        [this](const rclcpp_action::GoalUUID& uuid,
+               std::shared_ptr<const QwenInference::Goal> goal) {
+            return onGoal(uuid, std::move(goal));
+        },
+        [this](const std::shared_ptr<GoalHandleQwenInference> goalHandle) {
+            return onCancel(goalHandle);
+        },
+        [this](const std::shared_ptr<GoalHandleQwenInference> goalHandle) {
+            onAccepted(goalHandle);
+        });
     workerThread_ = std::thread(&QwenDescriptionNode::workerLoop, this);
-    RCLCPP_INFO(get_logger(), "Qwen3-VL runtime loaded from %s", engineDir_.c_str());
+    RCLCPP_INFO(get_logger(), "Qwen3-VL runtime loaded from %s; action ready at %s",
+                engineDir_.c_str(), actionName_.c_str());
 }
 
 QwenDescriptionNode::~QwenDescriptionNode() {
+    actionServer_.reset();
     imageSubscription_.reset();
     detectionSubscription_.reset();
     {
         std::lock_guard<std::mutex> lock(jobMutex_);
         stopWorker_ = true;
-        pendingJob_.reset();
     }
     jobReady_.notify_one();
     if (workerThread_.joinable()) workerThread_.join();
@@ -80,15 +91,7 @@ QwenDescriptionNode::~QwenDescriptionNode() {
 void QwenDescriptionNode::onImage(sensor_msgs::msg::CompressedImage::ConstSharedPtr image) {
     if (!image || image->data.empty()) return;
     std::lock_guard<std::mutex> lock(cacheMutex_);
-    ++imageCount_;
-    if (imageCount_ % inferenceEveryNFrames_ != 0) return;
-    RCLCPP_INFO(get_logger(), "Qwen JPEG 采样：image_count=%lu，已有检测=%s",
-                static_cast<unsigned long>(imageCount_), haveDetection_ ? "是" : "否");
-    if (!haveDetection_) return;
-    std::lock_guard<std::mutex> jobLock(jobMutex_);
-    if (stopWorker_) return;
-    pendingJob_ = Job{std::move(image), latestDetection_};
-    jobReady_.notify_one();
+    latestImage_ = std::move(image);
 }
 
 void QwenDescriptionNode::onDetection(
@@ -105,10 +108,9 @@ void QwenDescriptionNode::onDetection(
             RCLCPP_WARN(get_logger(), "检测结果未匹配 target_classes，后续将回退使用全部实例");
         }
     }
-    if (detection.instances.empty()) return;
     std::lock_guard<std::mutex> lock(cacheMutex_);
     latestDetection_ = std::move(detection);
-    haveDetection_ = true;
+    haveDetection_ = !latestDetection_.instances.empty();
 }
 
 bool QwenDescriptionNode::isTarget(
@@ -118,9 +120,10 @@ bool QwenDescriptionNode::isTarget(
         std::find(targetClasses_.begin(), targetClasses_.end(), instance.class_name) != targetClasses_.end();
 }
 
-std::string QwenDescriptionNode::buildPrompt(const Detection& detection) const {
+std::string QwenDescriptionNode::buildPrompt(
+    const std::string& requestPrompt, const Detection& detection) const {
     std::ostringstream prompt;
-    prompt << promptPrefix_ << "\n检测候选目标：\n";
+    prompt << requestPrompt << "\n检测候选目标：\n";
     for (size_t index = 0; index < detection.instances.size(); ++index) {
         const auto& item = detection.instances[index];
         prompt << index + 1 << ". " << item.class_name << "，置信度 " << item.confidence
@@ -148,49 +151,115 @@ trt_edgellm::rt::imageUtils::ImageData QwenDescriptionNode::makeImage(
     return result;
 }
 
+rclcpp_action::GoalResponse QwenDescriptionNode::onGoal(
+    const rclcpp_action::GoalUUID&,
+    std::shared_ptr<const QwenInference::Goal> goal) {
+    if (!goal || goal->prompt.empty()) {
+        RCLCPP_WARN(get_logger(), "拒绝空 prompt 的 Qwen goal");
+        return rclcpp_action::GoalResponse::REJECT;
+    }
+    bool expected = false;
+    if (!goalActive_.compare_exchange_strong(expected, true)) {
+        RCLCPP_WARN(get_logger(), "Qwen 正在推理，拒绝新的 goal");
+        return rclcpp_action::GoalResponse::REJECT;
+    }
+    return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+}
+
+rclcpp_action::CancelResponse QwenDescriptionNode::onCancel(
+    const std::shared_ptr<GoalHandleQwenInference>) {
+    return rclcpp_action::CancelResponse::ACCEPT;
+}
+
+void QwenDescriptionNode::onAccepted(
+    const std::shared_ptr<GoalHandleQwenInference> goalHandle) {
+    {
+        std::lock_guard<std::mutex> lock(jobMutex_);
+        pendingGoal_ = goalHandle;
+    }
+    jobReady_.notify_one();
+}
+
 void QwenDescriptionNode::workerLoop() {
     while (true) {
-        Job job;
+        std::shared_ptr<GoalHandleQwenInference> goalHandle;
         {
             std::unique_lock<std::mutex> lock(jobMutex_);
-            jobReady_.wait(lock, [this] { return stopWorker_ || pendingJob_.has_value(); });
-            if (stopWorker_) return;
-            job = std::move(*pendingJob_);
-            pendingJob_.reset();
+            jobReady_.wait(lock, [this] { return stopWorker_ || pendingGoal_.has_value(); });
+            if (stopWorker_ && !pendingGoal_) return;
+            goalHandle = std::move(*pendingGoal_);
+            pendingGoal_.reset();
         }
-        process(std::move(job));
+        processGoal(goalHandle);
+        goalActive_.store(false);
     }
 }
 
-void QwenDescriptionNode::process(Job job) {
-    argus_interfaces::msg::ArgusQwenDescription output;
-    output.header = job.detection.header;
-    output.frame_number = job.detection.frameNumber;
-    for (const auto& instance : job.detection.instances) output.candidate_classes.push_back(instance.class_name);
+void QwenDescriptionNode::processGoal(
+    const std::shared_ptr<GoalHandleQwenInference>& goalHandle) {
+    const auto goal = goalHandle->get_goal();
+    auto result = std::make_shared<QwenInference::Result>();
+    auto& output = result->result;
+    auto publishStage = [&goalHandle](const std::string& stage) {
+        auto feedback = std::make_shared<QwenInference::Feedback>();
+        feedback->stage = stage;
+        goalHandle->publish_feedback(feedback);
+    };
+
+    if (goalHandle->is_canceling()) {
+        output.error_message = "推理已取消";
+        goalHandle->canceled(result);
+        return;
+    }
+    publishStage("preparing");
+
+    sensor_msgs::msg::CompressedImage::ConstSharedPtr image;
+    Detection detection;
+    bool haveDetection = false;
+    {
+        std::lock_guard<std::mutex> lock(cacheMutex_);
+        image = latestImage_;
+        detection = latestDetection_;
+        haveDetection = haveDetection_;
+    }
+    if (!image) {
+        output.error_message = "尚未收到可用于推理的图像";
+        goalHandle->abort(result);
+        return;
+    }
+    output.header = image->header;
+    if (haveDetection) {
+        output.frame_number = detection.frameNumber;
+        for (const auto& instance : detection.instances) {
+            output.candidate_classes.push_back(instance.class_name);
+        }
+    }
+
     const auto start = std::chrono::steady_clock::now();
     try {
-        trt_edgellm::rt::LLMGenerationRequest request;
+        publishStage("inferencing");
         trt_edgellm::rt::Message message;
         message.role = "user";
         message.contents.push_back({"image", ""});
-        message.contents.push_back({"text", buildPrompt(job.detection)});
-        request.requests.resize(1);
-        request.requests[0].messages.push_back(std::move(message));
-        request.requests[0].imageBuffers.push_back(makeImage(*job.image));
-        request.temperature = static_cast<float>(temperature_);
-        request.topP = 1.0F;
-        request.topK = 1;
-        request.maxGenerateLength = maxGenerateLength_;
-        trt_edgellm::rt::LLMGenerationResponse response;
-        if (!runtime_->handleRequest(request, response, stream_) || response.outputTexts.empty()) {
+        const std::string prompt = goal->include_detection_context && haveDetection
+            ? buildPrompt(goal->prompt, detection)
+            : goal->prompt;
+        message.contents.push_back({"text", prompt});
+        trt_edgellm::rt::LLMGenerationRequest generationRequest;
+        generationRequest.requests.resize(1);
+        generationRequest.requests[0].messages.push_back(std::move(message));
+        generationRequest.requests[0].imageBuffers.push_back(makeImage(*image));
+        generationRequest.temperature = static_cast<float>(temperature_);
+        generationRequest.topP = 1.0F;
+        generationRequest.topK = 1;
+        generationRequest.maxGenerateLength = maxGenerateLength_;
+        trt_edgellm::rt::LLMGenerationResponse generationResponse;
+        if (!runtime_->handleRequest(generationRequest, generationResponse, stream_) ||
+            generationResponse.outputTexts.empty()) {
             throw std::runtime_error("Qwen runtime handleRequest failed");
         }
-        output.description = response.outputTexts.front();
+        output.description = generationResponse.outputTexts.front();
         output.success = true;
-        RCLCPP_INFO(get_logger(), "Qwen 推理完成：frame=%lu，候选目标=%zu，耗时=%.2f ms，描述：%s",
-                    static_cast<unsigned long>(output.frame_number),
-                    output.candidate_classes.size(), output.inference_ms,
-                    output.description.c_str());
     } catch (const std::exception& error) {
         output.success = false;
         output.error_message = error.what();
@@ -198,12 +267,27 @@ void QwenDescriptionNode::process(Job job) {
     }
     output.inference_ms = static_cast<float>(std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - start).count());
-    if (!output.success) {
+    if (output.success) {
+        RCLCPP_INFO(get_logger(), "Qwen 推理完成：frame=%lu，候选目标=%zu，耗时=%.2f ms",
+                    static_cast<unsigned long>(output.frame_number),
+                    output.candidate_classes.size(), output.inference_ms);
+    } else {
         RCLCPP_WARN(get_logger(), "Qwen 推理失败：frame=%lu，耗时=%.2f ms，错误：%s",
                     static_cast<unsigned long>(output.frame_number), output.inference_ms,
                     output.error_message.c_str());
     }
-    publisher_->publish(std::move(output));
+    if (goalHandle->is_canceling()) {
+        output.success = false;
+        output.error_message = "推理已取消";
+        publisher_->publish(output);
+        goalHandle->canceled(result);
+    } else if (output.success) {
+        publisher_->publish(output);
+        goalHandle->succeed(result);
+    } else {
+        publisher_->publish(output);
+        goalHandle->abort(result);
+    }
 }
 
 }  // namespace qwen_description

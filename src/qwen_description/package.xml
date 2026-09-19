@@ -9,6 +9,7 @@
   <depend>argus_interfaces</depend>
   <depend>argus_transport</depend>
   <depend>rclcpp</depend>
+  <depend>rclcpp_action</depend>
   <depend>rclcpp_components</depend>
   <depend>sensor_msgs</depend>
   <export><build_type>ament_cmake</build_type></export>

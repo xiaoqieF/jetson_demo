@@ -1,0 +1,6 @@
+string prompt
+bool include_detection_context
+---
+ArgusQwenDescription result
+---
+string stage

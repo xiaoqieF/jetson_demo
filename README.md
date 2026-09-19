@@ -166,6 +166,29 @@ trtexec --onnx=/home/royfan/yolov8_trt/yolov8s-seg.onnx \
 ros2 launch argus_bringup argus_pipeline.launch.py
 ```
 
+## Qwen 按需推理 Action
+
+`qwen_description_node` 不再按固定帧间隔自动推理。节点持续缓存
+`/camera/image/compressed` 的最新一帧，只在收到 `/camera/inference/qwen` action goal 时执行一次
+Qwen3-VL 推理。请求中的 `prompt` 会作为本次推理提示词，不再使用节点内置的固定提示词：
+
+```bash
+ros2 action send_goal /camera/inference/qwen argus_interfaces/action/QwenInference \
+  "{prompt: '请用中文描述画面中的人正在做什么', include_detection_context: false}" \
+  --feedback
+```
+
+`include_detection_context=true` 时，节点会把最新 YOLO 检测候选类别、置信度和边界框追加到
+本次提示词；设为 `false` 时，Qwen 只接收调用方提供的提示词和最新图像。Action result 中的 `result`
+包含 `description`、`success`、`error_message`、`inference_ms`、图像 header，以及可用时的检测
+帧号和候选类别。为兼容已有消费者，同一结果仍会发布到
+`/camera/inference/qwen_description`。尚未收到图像或提示词为空时不会执行推理，响应中的
+`success` 为 `false` 并通过 `error_message` 说明原因。执行期间 feedback 的 `stage` 会依次报告
+`preparing` 和 `inferencing`；同一时刻只接受一个 goal，已有推理运行时新 goal 会被拒绝。
+
+Action 名称可通过 `action_name` 参数修改；生成长度和采样仍分别由
+`max_generate_length`、`temperature` 参数控制。
+
 组件默认按 inference、visualization、camera 顺序加载；相机组件不等待订阅者发现即可开始
 采集。相机节点不再通过 ROS node parameter 接收配置，而是默认读取 `argus_camera` 安装目录
 下的 `config/argus_camera.yaml`。修改配置文件后重启节点即可生效，也可以通过环境变量

@@ -10,6 +10,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ArgusInstanceSegmentation.msg"
   "msg/ArgusQwenDescription.msg"
   "msg/ArgusInferenceResult.msg"
+  "action/QwenInference.action"
   DEPENDENCIES std_msgs)
 
 ament_export_dependencies(rosidl_default_runtime)

@@ -29,7 +29,7 @@ InferenceNode::InferenceNode(const rclcpp::NodeOptions& options)
     const auto enginePath = declare_parameter<std::string>("engine_path", "/home/royfan/engine/yolov8s-seg-official_fp16.engine");
     inputSize_ = declare_parameter<int>("input_size", 640);
     const auto requireFp16Engine = declare_parameter<bool>("require_fp16_engine", true);
-    const auto timingLogEveryNFrames = declare_parameter<int>("timing_log_every_n_frames", 30);
+    const auto timingLogEveryNFrames = declare_parameter<int>("timing_log_every_n_frames", 100);
     confidenceThreshold_ = static_cast<float>(declare_parameter<double>("confidence_threshold", 0.25));
     iouThreshold_ = static_cast<float>(declare_parameter<double>("iou_threshold", 0.45));
     overlayQuality_ = declare_parameter<int>("overlay_quality", 90);
