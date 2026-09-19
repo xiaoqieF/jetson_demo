@@ -2,6 +2,10 @@
 
 ## PC Operator UI
 
+[![PC Operator UI 演示](media/operator-ui-demo.png)](media/operator-ui-demo.mp4)
+
+> 点击上图观看完整演示（MP4，约 2.7 MiB）。
+
 `argus_operator_ui` 是运行在 PC 上的 PySide6 客户端。它只订阅
 `/camera/image/compressed` 与 `/camera/inference/result`，不会订阅只能在 Orin 同进程使用的
 `/camera/image/yuv`，也不会在 PC 启动 YOLO 或 Qwen 模型。UI 在本地完成 JPEG 解码、检测框与
