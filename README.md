@@ -1,5 +1,51 @@
 # LibArgus ROS2 同进程管线
 
+## 系统部署关系
+
+本项目由 **Jetson Orin Nano（边缘计算端）** 和 **PC（操作与显示端）** 两台机器组成。
+摄像头连接在 Orin Nano 上，图像采集以及所有 AI 模型推理都在 Orin Nano 本机完成；PC 不运行
+YOLO 或 Qwen 模型，只通过局域网中的 ROS 2 topic/Action 接收结果、显示画面和发起交互请求。
+
+```text
+Jetson Orin Nano（采集与推理）
+
+  CSI 摄像头 ─► LibArgus / ISP ─► NVMM YUV
+                                      ├─► YOLOv8-seg TensorRT
+                                      │       └─► 检测结果
+                                      └─► JPEG 编码 ─► 相机画面
+
+  Qwen3-VL TensorRT-LLM
+      ├─ 缓存最新 JPEG 与 YOLO 检测结果
+      └─ 收到 Action 请求后执行一次视觉问答
+
+           │  /camera/image/compressed：JPEG 相机画面
+           │  /camera/inference/result：YOLO 结构化结果
+           │  /camera/inference/qwen：提示词、反馈与文本结果
+           │
+           ▼  ROS 2 / 局域网
+
+PC（操作与显示，不运行模型）
+
+  PySide6 Operator UI
+      ├─ 解码并显示 JPEG 相机画面
+      ├─ 将 bbox / mask 绘制到对应画面
+      ├─ 向 Orin Nano 发送 Qwen 提示词
+      └─ 显示 Orin Nano 返回的 Qwen 文本结果
+```
+
+| 功能 | 运行位置 | 说明 |
+| --- | --- | --- |
+| 相机采集、ISP 与 NVMM buffer | Orin Nano | CSI 摄像头直接连接 Orin，由 LibArgus 采集 |
+| YOLOv8-seg 模型 | Orin Nano | 使用 TensorRT 对 NVMM 图像进行持续推理 |
+| Qwen3-VL 模型 | Orin Nano | 使用 TensorRT-LLM，收到 PC 的 Action 请求时按需推理 |
+| JPEG 编码与 ROS 2 发布 | Orin Nano | 将相机画面和结构化检测结果发送给 PC |
+| bbox / mask 叠加与实时画面 | PC | Operator UI 匹配图像和检测结果后在本地绘制 |
+| Qwen 对话界面 | PC | PC 只负责提交提示词并显示 Orin 返回的文本 |
+
+默认可视化路径是 **Orin Nano 发布原始 JPEG 和结构化 YOLO 结果，PC 在 UI 中完成叠加显示**。
+Orin Nano 也能通过 `enable_overlay:=true` 额外生成
+`/camera/inference/overlay/compressed`，但该服务端 overlay 默认关闭，不是 PC Operator UI 的主路径。
+
 ## PC Operator UI
 
 [![PC Operator UI 演示](media/operator-ui-demo.png)](media/operator-ui-demo.mp4)
